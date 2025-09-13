@@ -1,15 +1,22 @@
 # app.py
 import os
 from typing import List, Optional
-from fastapi import FastAPI, Depends, HTTPException, Header
+from datetime import datetime, timedelta, date
+import csv, io, json, smtplib
+
+from fastapi import FastAPI, Depends, HTTPException, Header, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, conint
-from sqlalchemy import (create_engine, Column, Integer, String, JSON, Boolean,
-                        DateTime, UniqueConstraint, ForeignKey, func)
+
+from sqlalchemy import (
+    create_engine, Column, Integer, String, JSON, Boolean,
+    DateTime, UniqueConstraint, ForeignKey, func
+)
 from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
 
+# ---------- DB & API KEY ----------
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./schedule.db")
-API_KEY = os.getenv("API_KEY", "changeme")  # set on server
+API_KEY = os.getenv("API_KEY", "changeme")  # must match X-API-Key header
 
 engine = create_engine(
     DATABASE_URL,
@@ -18,9 +25,10 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
 
+# ---------- MODELS ----------
 class Plan(Base):
     __tablename__ = "plans"
-    id = Column(String, primary_key=True)         # e.g., "default"
+    id = Column(String, primary_key=True)  # e.g., "default"
     name = Column(String, nullable=False)
     total_days = Column(Integer, default=60)
     areas = Column(JSON, default=[])
@@ -42,23 +50,23 @@ class Cell(Base):
 
 Base.metadata.create_all(engine)
 
-app = FastAPI()
+# ---------- APP ----------
+app = FastAPI(title="Remodel Planner API")
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
+    CORSMiddleware,
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
 )
 
 def get_db():
     db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    try: yield db
+    finally: db.close()
 
 def require_key(x_api_key: Optional[str] = Header(None)):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(401, "Invalid API key")
 
-# ---- Schemas ----
+# ---------- Schemas ----------
 class PlanUpsert(BaseModel):
     id: str = "default"
     name: str = "Default Plan"
@@ -75,14 +83,19 @@ class GridIn(BaseModel):
     cells: List[CellIn]
     allow_multiple: Optional[bool] = None
 
-# ---- Endpoints ----
+# ---------- Core Endpoints ----------
+@app.get("/")
+def root():
+    return {"ok": True, "service": "remodel-backend", "docs": "/docs", "now": datetime.utcnow().isoformat()}
+
 @app.post("/plans", dependencies=[Depends(require_key)], response_model=PlanUpsert)
 def create_or_update_plan(payload: PlanUpsert, db: Session = Depends(get_db)):
     p = db.get(Plan, payload.id)
     if p:
-        p.name, p.total_days, p.areas, p.allow_multiple = (
-            payload.name, payload.total_days, payload.areas, payload.allow_multiple
-        )
+        p.name = payload.name
+        p.total_days = payload.total_days
+        p.areas = payload.areas
+        p.allow_multiple = payload.allow_multiple
     else:
         p = Plan(**payload.dict())
         db.add(p)
@@ -99,35 +112,35 @@ def get_plan(plan_id: str, db: Session = Depends(get_db)):
 @app.get("/plans/{plan_id}/grid")
 def get_grid(plan_id: str, db: Session = Depends(get_db)):
     p = db.get(Plan, plan_id)
-    if not p: raise HTTPException(404)
+    if not p:
+        raise HTTPException(404, "Plan not found")
     rows = db.query(Cell).filter(Cell.plan_id == plan_id).all()
-    return {"allowMultiple": p.allow_multiple,
-            "cells": [{"area": c.area, "day": c.day, "activities": c.activities} for c in rows]}
+    return {
+        "allowMultiple": p.allow_multiple,
+        "cells": [{"area": c.area, "day": c.day, "activities": c.activities} for c in rows]
+    }
 
 @app.put("/plans/{plan_id}/grid", dependencies=[Depends(require_key)])
 def upsert_grid(plan_id: str, payload: GridIn, db: Session = Depends(get_db)):
     p = db.get(Plan, plan_id)
-    if not p: raise HTTPException(404, "Plan not found")
+    if not p:
+        raise HTTPException(404, "Plan not found")
     if payload.allow_multiple is not None:
         p.allow_multiple = payload.allow_multiple
+
     for c in payload.cells:
         row = db.query(Cell).filter_by(plan_id=plan_id, area=c.area, day=c.day).one_or_none()
         if row: row.activities = c.activities
         else:   db.add(Cell(plan_id=plan_id, area=c.area, day=c.day, activities=c.activities))
+
     db.commit()
     return {"ok": True}
 
 # =========================
-# Email + Rollover (append)
+# Email + Rollover
 # =========================
-import os, csv, io, json, smtplib
-from email.message import EmailMessage
-from datetime import datetime, timedelta, date
 
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-
-# Optional scheduling
+# Optional scheduler
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
@@ -135,11 +148,11 @@ try:
 except Exception:
     HAVE_SCHEDULER = False
 
-# ---------- Config via env ----------
+# Config via env
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata")
 DEFAULT_PLAN_ID = os.getenv("DEFAULT_PLAN_ID", "default")
 PROJECT_START_DATE = os.getenv("PROJECT_START_DATE")  # yyyy-mm-dd, optional
-FRONTEND_PUBLIC_BASE = os.getenv("FRONTEND_PUBLIC_BASE", "")  # optional public link to the app
+FRONTEND_PUBLIC_BASE = os.getenv("FRONTEND_PUBLIC_BASE", "")
 
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -149,12 +162,9 @@ SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "")
 DAILY_TO = [e.strip() for e in os.getenv("DAILY_TO", "").split(",") if e.strip()]
 
 def _today_local() -> date:
-    # simple local date (ok for IST)
     return datetime.now().date()
 
 def _get_start_date_for_plan(db: Session, plan_id: str) -> date:
-    # If you later store a start_date in Plan, read it here.
-    # For now we use PROJECT_START_DATE or today.
     if PROJECT_START_DATE:
         return datetime.strptime(PROJECT_START_DATE, "%Y-%m-%d").date()
     return _today_local()
@@ -174,7 +184,7 @@ def _fetch_cells_range(db: Session, plan_id: str, from_day: int, to_day: int):
     )
     return [{"area": r[0], "day": int(r[1]), "activities": r[2] or []} for r in rows]
 
-def _upsert_cell(db: Session, plan_id: str, area: str, day: int, acts: list[str]):
+def _upsert_cell(db: Session, plan_id: str, area: str, day: int, acts: List[str]):
     row = db.query(Cell).filter_by(plan_id=plan_id, area=area, day=day).one_or_none()
     if row:
         row.activities = acts
@@ -194,26 +204,22 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
                 t = {"name": str(s)}
             rows.append({
                 "date": _date_for_day(start_date, c["day"]).isoformat(),
-                "day": c["day"],
-                "area": c["area"],
-                "task": t.get("name", ""),
-                "role": t.get("role", ""),
-                "workers": t.get("workers", 0),
-                "hours": t.get("hours", 0),
+                "day": c["day"], "area": c["area"],
+                "task": t.get("name", ""), "role": t.get("role", ""),
+                "workers": t.get("workers", 0), "hours": t.get("hours", 0),
                 "done": "yes" if t.get("done") else ""
             })
 
-    # CSV attachment
+    # CSV
     csv_buf = io.StringIO()
     writer = csv.DictWriter(csv_buf, fieldnames=["date","day","area","task","role","workers","hours","done"])
     writer.writeheader()
     for r in rows: writer.writerow(r)
     csv_bytes = csv_buf.getvalue().encode("utf-8")
 
-    # Basic HTML
+    # HTML
     by_day = {}
-    for r in rows:
-        by_day.setdefault(int(r["day"]), []).append(r)
+    for r in rows: by_day.setdefault(int(r["day"]), []).append(r)
 
     def h(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
     sections = []
@@ -261,7 +267,6 @@ def _rollover_incomplete(db: Session, plan_id: str, from_day: int) -> int:
     to_day = from_day + 1
     src_rows = db.query(Cell).filter_by(plan_id=plan_id, day=from_day).all()
 
-    # Build destination map area -> activities list
     dest_rows = db.query(Cell).filter_by(plan_id=plan_id, day=to_day).all()
     dest_map = {r.area: (r.activities or []) for r in dest_rows}
 
@@ -273,11 +278,8 @@ def _rollover_incomplete(db: Session, plan_id: str, from_day: int) -> int:
                 t = json.loads(s)
             except Exception:
                 t = {"name": s}
-            if t.get("done"):
-                keep.append(json.dumps(t))
-            else:
-                carry.append(json.dumps(t))
-                moved += 1
+            if t.get("done"): keep.append(json.dumps(t))
+            else:             carry.append(json.dumps(t)); moved += 1
         row.activities = keep
         new_list = dest_map.get(row.area, [])
         if carry:
@@ -289,6 +291,23 @@ def _rollover_incomplete(db: Session, plan_id: str, from_day: int) -> int:
 
 ops = APIRouter(prefix="/ops", tags=["ops"])
 
+@ops.get("/ping")
+def ops_ping():
+    return {
+        "ok": True,
+        "ts": datetime.utcnow().isoformat(),
+        "has_email_route": True,
+        "smtp_configured": bool(SMTP_HOST and SMTP_USER and SMTP_PASS and DAILY_TO)
+    }
+
+@ops.get("/email_ping", dependencies=[Depends(require_key)])
+def email_ping():
+    # Minimal “hello” email to test SMTP quickly
+    html = "<b>Hello</b> from Remodel Planner."
+    _send_email(subject="Email ping", html=html,
+                csv_bytes=b"date,ok\n2025-09-13,yes\n", csv_name="ping.csv")
+    return {"ok": True}
+
 @ops.get("/send_daily_email", dependencies=[Depends(require_key)])
 def send_daily_email(plan_id: str = DEFAULT_PLAN_ID, span: int = 3):
     with SessionLocal() as db:
@@ -297,9 +316,7 @@ def send_daily_email(plan_id: str = DEFAULT_PLAN_ID, span: int = 3):
         html, csv_bytes = _build_three_day_report(db, plan_id, today_day, span=span)
         _send_email(
             subject=f"[{plan_id}] 3-day checklist (Day {today_day}–{today_day+span-1})",
-            html=html,
-            csv_bytes=csv_bytes,
-            csv_name=f"checklist_day{today_day}.csv",
+            html=html, csv_bytes=csv_bytes, csv_name=f"checklist_day{today_day}.csv",
         )
         return {"ok": True, "day": today_day}
 
@@ -314,8 +331,8 @@ def rollover(plan_id: str = DEFAULT_PLAN_ID):
 app.include_router(ops)
 
 # Optional in-process scheduler (07:00 email, 19:00 rollover)
-if HAVE_SCHEDULER:
-    try:
+try:
+    if HAVE_SCHEDULER:
         scheduler = BackgroundScheduler()
         def job_email():
             try:
@@ -342,6 +359,5 @@ if HAVE_SCHEDULER:
         scheduler.add_job(job_email,    CronTrigger(hour=7,  minute=0))
         scheduler.add_job(job_rollover, CronTrigger(hour=19, minute=0))
         scheduler.start()
-    except Exception as e:
-        print("Scheduler not started:", e)
-
+except Exception as e:
+    print("Scheduler not started:", e)
