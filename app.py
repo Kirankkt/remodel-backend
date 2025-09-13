@@ -3,6 +3,8 @@ import os
 from typing import List, Optional
 from datetime import datetime, timedelta, date
 import csv, io, json, smtplib
+from email.message import EmailMessage
+
 
 from fastapi import FastAPI, Depends, HTTPException, Header, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
