@@ -155,6 +155,37 @@ def _upsert_cell(db: Session, plan_id: str, area: str, day: int, acts: List[str]
         db.add(Cell(plan_id=plan_id, area=area, day=day, activities=acts))
 
 # =========================
+# Task normalization (NEW)
+# =========================
+def _normalize_task(obj_or_json):
+    """
+    Accepts an activity either as a JSON string or a dict.
+    Returns a dict with unified keys: name, role, workers, hours, done.
+    Supports both verbose keys (name/role/workers/hours/done)
+    and compact keys (n/r/w/h/d or x or dd).
+    """
+    try:
+        t = json.loads(obj_or_json) if isinstance(obj_or_json, str) else dict(obj_or_json or {})
+    except Exception:
+        return {"name": str(obj_or_json), "role": "", "workers": 0, "hours": 0, "done": False}
+
+    name = t.get("name") or t.get("task") or t.get("n") or ""
+    role = t.get("role") or t.get("r") or ""
+    workers = t.get("workers", t.get("w", 0)) or 0
+    hours = t.get("hours", t.get("h", 0)) or 0
+
+    # Any of these flags means done
+    done = bool(t.get("done") or t.get("d") or t.get("x") or t.get("dd"))
+
+    return {
+        "name": name,
+        "role": role,
+        "workers": int(workers),
+        "hours": int(hours),
+        "done": done,
+    }
+
+# =========================
 # Email builders + senders
 # =========================
 def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int = 3):
@@ -164,28 +195,30 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
     rows = []
     for c in cells:
         for s in (c["activities"] or []):
-            try:
-                t = json.loads(s)
-            except Exception:
-                t = {"name": str(s)}
+            nt = _normalize_task(s)
             rows.append({
                 "date": _date_for_day(start_date, c["day"]).isoformat(),
-                "day": c["day"], "area": c["area"],
-                "task": t.get("name", ""), "role": t.get("role", ""),
-                "workers": t.get("workers", 0), "hours": t.get("hours", 0),
-                "done": "yes" if t.get("done") else ""
+                "day": c["day"],
+                "area": c["area"],
+                "task": nt["name"],
+                "role": nt["role"],
+                "workers": nt["workers"],
+                "hours": nt["hours"],
+                "done": "yes" if nt["done"] else ""
             })
 
     # CSV
     csv_buf = io.StringIO()
     writer = csv.DictWriter(csv_buf, fieldnames=["date","day","area","task","role","workers","hours","done"])
     writer.writeheader()
-    for r in rows: writer.writerow(r)
+    for r in rows:
+        writer.writerow(r)
     csv_bytes = csv_buf.getvalue().encode("utf-8")
 
     # HTML
     by_day = {}
-    for r in rows: by_day.setdefault(int(r["day"]), []).append(r)
+    for r in rows:
+        by_day.setdefault(int(r["day"]), []).append(r)
 
     def h(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
     sections = []
@@ -205,7 +238,7 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
                       f"{FRONTEND_PUBLIC_BASE}/checklist.html?plan={plan_id}&startDay={start_day}&days={span}")
     html = f"""
     <div style="font-family:Arial,Helvetica,sans-serif">
-      <p>Good morning! Here is the 3-day plan.</p>
+      <p>Good morning! Here is the {span}-day plan.</p>
       {('<p><a href="'+h(checklist_link)+'" style="display:inline-block;background:#2563eb;color:#fff;padding:10px 14px;border-radius:6px;text-decoration:none">Open live checklist</a></p>' if checklist_link else '')}
       {''.join(sections)}
     </div>
@@ -268,12 +301,13 @@ def _rollover_incomplete(db: Session, plan_id: str, from_day: int) -> int:
     for row in src_rows:
         keep, carry = [], []
         for s in (row.activities or []):
-            try:
-                t = json.loads(s)
-            except Exception:
-                t = {"name": s}
-            if t.get("done"): keep.append(json.dumps(t))
-            else:             carry.append(json.dumps(t)); moved += 1
+            nt = _normalize_task(s)  # just to check done in any format
+            # Keep the ORIGINAL string/object 's' to avoid reformatting storage
+            if nt["done"]:
+                keep.append(s)
+            else:
+                carry.append(s)
+                moved += 1
         row.activities = keep
         new_list = dest_map.get(row.area, [])
         if carry:
@@ -439,3 +473,4 @@ if HAVE_SCHEDULER:
         scheduler.start()
     except Exception as e:
         print("Scheduler not started:", e)
+
