@@ -1,4 +1,14 @@
-F
+# app.py
+import os
+import csv
+import io
+import json
+import base64
+import smtplib
+from typing import List, Optional
+from datetime import datetime, timedelta, date
+from email.message import EmailMessage
+
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Header, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,14 +25,13 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
 # =========================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./schedule.db")
 API_KEY      = os.getenv("API_KEY", "changeme")  # must match X-API-Key header
-CHECK_TOKEN = os.getenv("CHECK_TOKEN", "RMETVM")  # shared-secret for checklist writes
-
+CHECK_TOKEN  = os.getenv("CHECK_TOKEN", "RMETVM")  # shared-secret for checklist writes
 
 # Email + report options
-TIMEZONE            = os.getenv("TIMEZONE", "Asia/Kolkata")
-DEFAULT_PLAN_ID     = os.getenv("DEFAULT_PLAN_ID", "default")
-PROJECT_START_DATE  = os.getenv("PROJECT_START_DATE")  # yyyy-mm-dd, optional
-FRONTEND_PUBLIC_BASE= os.getenv("FRONTEND_PUBLIC_BASE", "")
+TIMEZONE             = os.getenv("TIMEZONE", "Asia/Kolkata")
+DEFAULT_PLAN_ID      = os.getenv("DEFAULT_PLAN_ID", "default")
+PROJECT_START_DATE   = os.getenv("PROJECT_START_DATE")  # yyyy-mm-dd, optional
+FRONTEND_PUBLIC_BASE = os.getenv("FRONTEND_PUBLIC_BASE", "")
 
 # SMTP (fallback)
 SMTP_HOST = os.getenv("SMTP_HOST")
@@ -48,7 +57,6 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
 
-
 class Plan(Base):
     __tablename__ = "plans"
     id = Column(String, primary_key=True)  # e.g., "default"
@@ -58,7 +66,6 @@ class Plan(Base):
     allow_multiple = Column(Boolean, default=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     cells = relationship("Cell", cascade="all, delete-orphan", back_populates="plan")
-
 
 class Cell(Base):
     __tablename__ = "cells"
@@ -71,7 +78,6 @@ class Cell(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     plan = relationship("Plan", back_populates="cells")
     __table_args__ = (UniqueConstraint("plan_id", "area", "day", name="uniq_cell"),)
-
 
 Base.metadata.create_all(engine)
 
@@ -86,12 +92,17 @@ app.add_middleware(
 
 def get_db():
     db = SessionLocal()
-    try: yield db
-    finally: db.close()
+    try:
+        yield db
+    finally:
+        db.close()
 
 def require_key(x_api_key: Optional[str] = Header(None)):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(401, "Invalid API key")
+
+# ---- Ops router (declare BEFORE using it) ----
+ops = APIRouter(prefix="/ops", tags=["ops"])
 
 # =========================
 # Schemas
@@ -112,6 +123,7 @@ class GridIn(BaseModel):
     cells: List[CellIn]
     allow_multiple: Optional[bool] = None
 
+# Checklist payloads
 class ChecklistCellUpdate(BaseModel):
     area: str
     day: conint(ge=1)
@@ -121,55 +133,6 @@ class ChecklistCellUpdate(BaseModel):
 class ChecklistUpdateIn(BaseModel):
     plan_id: str = DEFAULT_PLAN_ID
     updates: List[ChecklistCellUpdate]
-
-@ops.post("/checklist_mark")
-def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
-    if not CHECK_TOKEN or token != CHECK_TOKEN:
-        raise HTTPException(401, "Invalid token")
-
-    for upd in payload.updates:
-        row = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=upd.day).one_or_none()
-        if not row:
-            continue
-        acts = list(row.activities or [])
-
-        for idx in set(upd.done or []):
-            if 0 <= idx < len(acts):
-                raw = acts[idx]
-                # preserve style if possible (compact vs verbose)
-                try:
-                    d = json.loads(raw) if isinstance(raw, str) else dict(raw)
-                except Exception:
-                    d = {"name": str(raw)}
-                # decide output keys
-                style_compact = any(k in d for k in ("n","r","w","h")) and not ("name" in d)
-                if style_compact:
-                    d["x"] = True
-                else:
-                    d["done"] = True
-                acts[idx] = json.dumps(d, ensure_ascii=False)
-
-        for idx in set(upd.undone or []):
-            if 0 <= idx < len(acts):
-                raw = acts[idx]
-                try:
-                    d = json.loads(raw) if isinstance(raw, str) else dict(raw)
-                except Exception:
-                    d = {"name": str(raw)}
-                style_compact = any(k in d for k in ("n","r","w","h")) and not ("name" in d)
-                if style_compact:
-                    d["x"] = False
-                    d["d"] = False
-                    d["dd"] = False
-                else:
-                    d["done"] = False
-                acts[idx] = json.dumps(d, ensure_ascii=False)
-
-        row.activities = acts
-
-    db.commit()
-    return {"ok": True}
-
 
 # =========================
 # Utilities: dates, grid helpers
@@ -192,9 +155,9 @@ def _date_for_day(start: date, day: int) -> date:
 def _fetch_cells_range(db: Session, plan_id: str, from_day: int, to_day: int):
     rows = (
         db.query(Cell.area, Cell.day, Cell.activities)
-        .filter(Cell.plan_id == plan_id, Cell.day >= from_day, Cell.day <= to_day)
-        .order_by(Cell.day.asc(), Cell.area.asc())
-        .all()
+          .filter(Cell.plan_id == plan_id, Cell.day >= from_day, Cell.day <= to_day)
+          .order_by(Cell.day.asc(), Cell.area.asc())
+          .all()
     )
     return [{"area": r[0], "day": int(r[1]), "activities": r[2] or []} for r in rows]
 
@@ -206,7 +169,7 @@ def _upsert_cell(db: Session, plan_id: str, area: str, day: int, acts: List[str]
         db.add(Cell(plan_id=plan_id, area=area, day=day, activities=acts))
 
 # =========================
-# Task normalization (NEW)
+# Task normalization
 # =========================
 def _normalize_task(obj_or_json):
     """
@@ -220,21 +183,65 @@ def _normalize_task(obj_or_json):
     except Exception:
         return {"name": str(obj_or_json), "role": "", "workers": 0, "hours": 0, "done": False}
 
-    name = t.get("name") or t.get("task") or t.get("n") or ""
-    role = t.get("role") or t.get("r") or ""
+    name    = t.get("name") or t.get("task") or t.get("n") or ""
+    role    = t.get("role") or t.get("r") or ""
     workers = t.get("workers", t.get("w", 0)) or 0
-    hours = t.get("hours", t.get("h", 0)) or 0
+    hours   = t.get("hours", t.get("h", 0)) or 0
+    done    = bool(t.get("done") or t.get("d") or t.get("x") or t.get("dd"))
 
-    # Any of these flags means done
-    done = bool(t.get("done") or t.get("d") or t.get("x") or t.get("dd"))
+    return {"name": name, "role": role, "workers": int(workers), "hours": int(hours), "done": done}
 
-    return {
-        "name": name,
-        "role": role,
-        "workers": int(workers),
-        "hours": int(hours),
-        "done": done,
-    }
+# =========================
+# Checklist write endpoint
+# =========================
+@ops.post("/checklist_mark")
+def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
+    # Token is expected as a query param: /ops/checklist_mark?token=XXXXXX
+    if not CHECK_TOKEN or token != CHECK_TOKEN:
+        raise HTTPException(401, "Invalid token")
+
+    for upd in payload.updates:
+        row = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=upd.day).one_or_none()
+        if not row:
+            continue
+        acts = list(row.activities or [])
+
+        # Mark done
+        for idx in set(upd.done or []):
+            if 0 <= idx < len(acts):
+                raw = acts[idx]
+                try:
+                    d = json.loads(raw) if isinstance(raw, str) else dict(raw)
+                except Exception:
+                    d = {"name": str(raw)}
+                style_compact = any(k in d for k in ("n", "r", "w", "h")) and ("name" not in d)
+                if style_compact:
+                    d["x"] = True
+                else:
+                    d["done"] = True
+                acts[idx] = json.dumps(d, ensure_ascii=False)
+
+        # Mark NOT done
+        for idx in set(upd.undone or []):
+            if 0 <= idx < len(acts):
+                raw = acts[idx]
+                try:
+                    d = json.loads(raw) if isinstance(raw, str) else dict(raw)
+                except Exception:
+                    d = {"name": str(raw)}
+                style_compact = any(k in d for k in ("n", "r", "w", "h")) and ("name" not in d)
+                if style_compact:
+                    d["x"]  = False
+                    d["d"]  = False
+                    d["dd"] = False
+                else:
+                    d["done"] = False
+                acts[idx] = json.dumps(d, ensure_ascii=False)
+
+        row.activities = acts
+
+    db.commit()
+    return {"ok": True}
 
 # =========================
 # Email builders + senders
@@ -260,7 +267,7 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
 
     # CSV
     csv_buf = io.StringIO()
-    writer = csv.DictWriter(csv_buf, fieldnames=["date","day","area","task","role","workers","hours","done"])
+    writer = csv.DictWriter(csv_buf, fieldnames=["date", "day", "area", "task", "role", "workers", "hours", "done"])
     writer.writeheader()
     for r in rows:
         writer.writerow(r)
@@ -271,25 +278,33 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
     for r in rows:
         by_day.setdefault(int(r["day"]), []).append(r)
 
-    def h(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    def h(s): 
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
     sections = []
     for d in range(start_day, start_day + span):
         the_date = _date_for_day(start_date, d).strftime("%d %b %Y")
-        section = [f"<h3>Day {d} — {the_date}</h3>",
-                   "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:Arial;font-size:14px'>",
-                   "<tr style='background:#f3f4f6'><th>Area</th><th>Task</th><th>Role</th><th>Workers</th><th>Hours</th></tr>"]
+        section = [
+            f"<h3>Day {d} — {the_date}</h3>",
+            "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:Arial;font-size:14px'>",
+            "<tr style='background:#f3f4f6'><th>Area</th><th>Task</th><th>Role</th><th>Workers</th><th>Hours</th></tr>"
+        ]
         for r in by_day.get(d, []):
-            section.append(f"<tr><td>{h(r['area'])}</td><td>{h(r['task'])}</td><td>{h(r['role'])}</td><td>{r['workers']}</td><td>{r['hours']}</td></tr>")
+            section.append(
+                f"<tr><td>{h(r['area'])}</td><td>{h(r['task'])}</td><td>{h(r['role'])}</td>"
+                f"<td>{r['workers']}</td><td>{r['hours']}</td></tr>"
+            )
         if not by_day.get(d):
             section.append("<tr><td colspan='5' style='color:#6b7280'>No tasks</td></tr>")
         section.append("</table>")
         sections.append("\n".join(section))
 
-checklist_link = (
-    FRONTEND_PUBLIC_BASE and
-    f"{FRONTEND_PUBLIC_BASE}/checklist.html?plan={plan_id}&startDay={start_day}&days={span}" +
-    (f"&t={CHECK_TOKEN}" if CHECK_TOKEN else "")
-)
+    # Checklist link (inside the function; includes token)
+    checklist_link = (
+        FRONTEND_PUBLIC_BASE and
+        f"{FRONTEND_PUBLIC_BASE}/checklist.html?plan={plan_id}&startDay={start_day}&days={span}"
+        + (f"&t={CHECK_TOKEN}" if CHECK_TOKEN else "")
+    )
 
     html = f"""
     <div style="font-family:Arial,Helvetica,sans-serif">
@@ -356,10 +371,9 @@ def _rollover_incomplete(db: Session, plan_id: str, from_day: int) -> int:
     for row in src_rows:
         keep, carry = [], []
         for s in (row.activities or []):
-            nt = _normalize_task(s)  # just to check done in any format
-            # Keep the ORIGINAL string/object 's' to avoid reformatting storage
+            nt = _normalize_task(s)  # check done in any format
             if nt["done"]:
-                keep.append(s)
+                keep.append(s)   # keep original representation
             else:
                 carry.append(s)
                 moved += 1
@@ -427,14 +441,13 @@ def upsert_grid(plan_id: str, payload: GridIn, db: Session = Depends(get_db)):
 
     for c in payload.cells:
         row = db.query(Cell).filter_by(plan_id=plan_id, area=c.area, day=c.day).one_or_none()
-        if row: row.activities = c.activities
-        else:   db.add(Cell(plan_id=plan_id, area=c.area, day=c.day, activities=c.activities))
+        if row:
+            row.activities = c.activities
+        else:
+            db.add(Cell(plan_id=plan_id, area=c.area, day=c.day, activities=c.activities))
 
     db.commit()
     return {"ok": True}
-
-# ---- Ops router (email / rollover) ----
-ops = APIRouter(prefix="/ops", tags=["ops"])
 
 @ops.get("/ping")
 def ops_ping():
@@ -468,7 +481,7 @@ def send_daily_email(plan_id: str = DEFAULT_PLAN_ID, span: int = 3):
             today_day = _day_for_date(start_date, _today_local())
             html, csv_bytes = _build_three_day_report(db, plan_id, today_day, span=span)
             _send_email(
-                subject=f"[{plan_id}] 3-day checklist (Day {today_day}–{today_day+span-1})",
+                subject=f"[{plan_id}] {span}-day checklist (Day {today_day}–{today_day+span-1})",
                 html=html, csv_bytes=csv_bytes, csv_name=f"checklist_day{today_day}.csv",
             )
             return {"ok": True, "day": today_day}
@@ -501,6 +514,7 @@ except Exception:
 if HAVE_SCHEDULER:
     try:
         scheduler = BackgroundScheduler()
+
         def job_email():
             try:
                 with SessionLocal() as db:
@@ -509,7 +523,8 @@ if HAVE_SCHEDULER:
                     html, csv_bytes = _build_three_day_report(db, DEFAULT_PLAN_ID, today_day, span=3)
                     _send_email(
                         subject=f"[{DEFAULT_PLAN_ID}] 3-day checklist (Day {today_day}–{today_day+2})",
-                        html=html, csv_bytes=csv_bytes, csv_name=f"checklist_day{today_day}.csv")
+                        html=html, csv_bytes=csv_bytes, csv_name=f"checklist_day{today_day}.csv"
+                    )
             except Exception as e:
                 print("Morning email failed:", e)
 
@@ -528,4 +543,3 @@ if HAVE_SCHEDULER:
         scheduler.start()
     except Exception as e:
         print("Scheduler not started:", e)
-
