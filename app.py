@@ -1,14 +1,4 @@
-# app.py
-import os
-import csv
-import io
-import json
-import base64
-import smtplib
-from typing import List, Optional
-from datetime import datetime, timedelta, date
-from email.message import EmailMessage
-
+F
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Header, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +15,8 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
 # =========================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./schedule.db")
 API_KEY      = os.getenv("API_KEY", "changeme")  # must match X-API-Key header
+CHECK_TOKEN = os.getenv("CHECK_TOKEN", "RMETVM")  # shared-secret for checklist writes
+
 
 # Email + report options
 TIMEZONE            = os.getenv("TIMEZONE", "Asia/Kolkata")
@@ -119,6 +111,65 @@ class CellIn(BaseModel):
 class GridIn(BaseModel):
     cells: List[CellIn]
     allow_multiple: Optional[bool] = None
+
+class ChecklistCellUpdate(BaseModel):
+    area: str
+    day: conint(ge=1)
+    done: List[int] = []      # task indexes to mark done
+    undone: List[int] = []    # task indexes to mark NOT done
+
+class ChecklistUpdateIn(BaseModel):
+    plan_id: str = DEFAULT_PLAN_ID
+    updates: List[ChecklistCellUpdate]
+
+@ops.post("/checklist_mark")
+def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
+    if not CHECK_TOKEN or token != CHECK_TOKEN:
+        raise HTTPException(401, "Invalid token")
+
+    for upd in payload.updates:
+        row = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=upd.day).one_or_none()
+        if not row:
+            continue
+        acts = list(row.activities or [])
+
+        for idx in set(upd.done or []):
+            if 0 <= idx < len(acts):
+                raw = acts[idx]
+                # preserve style if possible (compact vs verbose)
+                try:
+                    d = json.loads(raw) if isinstance(raw, str) else dict(raw)
+                except Exception:
+                    d = {"name": str(raw)}
+                # decide output keys
+                style_compact = any(k in d for k in ("n","r","w","h")) and not ("name" in d)
+                if style_compact:
+                    d["x"] = True
+                else:
+                    d["done"] = True
+                acts[idx] = json.dumps(d, ensure_ascii=False)
+
+        for idx in set(upd.undone or []):
+            if 0 <= idx < len(acts):
+                raw = acts[idx]
+                try:
+                    d = json.loads(raw) if isinstance(raw, str) else dict(raw)
+                except Exception:
+                    d = {"name": str(raw)}
+                style_compact = any(k in d for k in ("n","r","w","h")) and not ("name" in d)
+                if style_compact:
+                    d["x"] = False
+                    d["d"] = False
+                    d["dd"] = False
+                else:
+                    d["done"] = False
+                acts[idx] = json.dumps(d, ensure_ascii=False)
+
+        row.activities = acts
+
+    db.commit()
+    return {"ok": True}
+
 
 # =========================
 # Utilities: dates, grid helpers
@@ -234,8 +285,12 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
         section.append("</table>")
         sections.append("\n".join(section))
 
-    checklist_link = (FRONTEND_PUBLIC_BASE and
-                      f"{FRONTEND_PUBLIC_BASE}/checklist.html?plan={plan_id}&startDay={start_day}&days={span}")
+checklist_link = (
+    FRONTEND_PUBLIC_BASE and
+    f"{FRONTEND_PUBLIC_BASE}/checklist.html?plan={plan_id}&startDay={start_day}&days={span}" +
+    (f"&t={CHECK_TOKEN}" if CHECK_TOKEN else "")
+)
+
     html = f"""
     <div style="font-family:Arial,Helvetica,sans-serif">
       <p>Good morning! Here is the {span}-day plan.</p>
