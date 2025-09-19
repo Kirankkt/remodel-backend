@@ -24,8 +24,8 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
 # ENV / CONFIG
 # =========================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./schedule.db")
-API_KEY      = os.getenv("API_KEY", "changeme")  # must match X-API-Key header
-CHECK_TOKEN  = os.getenv("CHECK_TOKEN", "RMETVM")  # shared-secret for checklist writes
+API_KEY      = os.getenv("API_KEY", "changeme")      # must match X-API-Key header
+CHECK_TOKEN  = os.getenv("CHECK_TOKEN", "RMETVM")    # shared-secret for checklist writes
 
 # Email + report options
 TIMEZONE             = os.getenv("TIMEZONE", "Asia/Kolkata")
@@ -79,6 +79,23 @@ class Cell(Base):
     plan = relationship("Plan", back_populates="cells")
     __table_args__ = (UniqueConstraint("plan_id", "area", "day", name="uniq_cell"),)
 
+# --- NEW: Snapshot + RolloverLog tables ---
+class Snapshot(Base):
+    __tablename__ = "snapshots"
+    plan_id = Column(String, primary_key=True)
+    taken_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    grid = Column(JSON)  # list of {"area","day","activities":[...]}
+
+class RolloverLog(Base):
+    __tablename__ = "rollover_log"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plan_id = Column(String, index=True)
+    from_day = Column(Integer)
+    to_day = Column(Integer)
+    moved = Column(JSON)  # [{"area": str, "items": [activity,...]}]
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+# Create tables (ok to call more than once)
 Base.metadata.create_all(engine)
 
 # =========================
@@ -192,6 +209,80 @@ def _normalize_task(obj_or_json):
     return {"name": name, "role": role, "workers": int(workers), "hours": int(hours), "done": done}
 
 # =========================
+# Helpers for snapshot/reset/undo
+# =========================
+def _set_done_flag_value(raw, value: bool):
+    """Return the same task with done=false/true, preserving compact/verbose style."""
+    try:
+        t = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except Exception:
+        return raw  # plain strings have no flag; keep as-is
+
+    compact = any(k in t for k in ("n","r","w","h")) and ("name" not in t)
+    if compact:
+        if value:
+            t["x"] = True
+        else:
+            for k in ("x","d","dd"):
+                if k in t: t[k] = False
+    else:
+        t["done"] = bool(value)
+    return json.dumps(t, ensure_ascii=False)
+
+def _serialize_grid(db: Session, plan_id: str):
+    rows = db.query(Cell).filter(Cell.plan_id == plan_id).all()
+    return [{"area": r.area, "day": int(r.day), "activities": list(r.activities or [])} for r in rows]
+
+def _overwrite_grid(db: Session, plan_id: str, cells: List[dict]):
+    db.query(Cell).filter(Cell.plan_id == plan_id).delete()
+    for c in cells:
+        db.add(Cell(plan_id=plan_id, area=c["area"], day=int(c["day"]), activities=list(c.get("activities") or [])))
+    db.commit()
+
+def _canon(x):
+    """Canonical string for matching tasks whether they are JSON strings or dicts."""
+    if isinstance(x, str):
+        try:
+            obj = json.loads(x)
+            return json.dumps(obj, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            return x
+    try:
+        return json.dumps(x, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        return str(x)
+
+def _rollover_incomplete_with_detail(db: Session, plan_id: str, from_day: int):
+    """Same behavior as rollover, but also returns exact items moved so we can undo later."""
+    to_day = from_day + 1
+    src_rows = db.query(Cell).filter_by(plan_id=plan_id, day=from_day).all()
+    dest_rows = db.query(Cell).filter_by(plan_id=plan_id, day=to_day).all()
+    dest_map = {r.area: (r.activities or []) for r in dest_rows}
+
+    moved = 0
+    detail = []  # [{"area": area, "items":[...]}]
+
+    for row in src_rows:
+        keep, carry = [], []
+        for s in (row.activities or []):
+            nt = _normalize_task(s)
+            if nt["done"]:
+                keep.append(s)
+            else:
+                carry.append(s)
+                moved += 1
+        row.activities = keep
+
+        if carry:
+            new_list = dest_map.get(row.area, [])
+            new_list.extend(carry)
+            _upsert_cell(db, plan_id, row.area, to_day, new_list)
+            detail.append({"area": row.area, "items": carry})
+
+    db.commit()
+    return moved, detail
+
+# =========================
 # Checklist write endpoint
 # =========================
 @ops.post("/checklist_mark")
@@ -278,7 +369,7 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
     for r in rows:
         by_day.setdefault(int(r["day"]), []).append(r)
 
-    def h(s): 
+    def h(s):
         return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     sections = []
@@ -387,7 +478,7 @@ def _rollover_incomplete(db: Session, plan_id: str, from_day: int) -> int:
     return moved
 
 # =========================
-# Routes
+# Routes (core)
 # =========================
 @app.get("/")
 def root():
@@ -449,6 +540,9 @@ def upsert_grid(plan_id: str, payload: GridIn, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True}
 
+# =========================
+# Ops: status + email + rollover
+# =========================
 @ops.get("/ping")
 def ops_ping():
     return {
@@ -499,6 +593,109 @@ def rollover(plan_id: str = DEFAULT_PLAN_ID):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
+# =========================
+# Ops: NEW snapshot/reset/undo endpoints
+# =========================
+@ops.post("/snapshot_save", dependencies=[Depends(require_key)])
+def snapshot_save(plan_id: str = DEFAULT_PLAN_ID):
+    with SessionLocal() as db:
+        cells = _serialize_grid(db, plan_id)
+        snap = db.get(Snapshot, plan_id)
+        if snap:
+            snap.grid = cells
+        else:
+            db.add(Snapshot(plan_id=plan_id, grid=cells))
+        db.commit()
+        total = sum(len(c.get("activities") or []) for c in cells)
+        return {"ok": True, "plan_id": plan_id, "cells": len(cells), "tasks": total}
+
+@ops.post("/snapshot_reset", dependencies=[Depends(require_key)])
+def snapshot_reset(plan_id: str = DEFAULT_PLAN_ID, reset_done: bool = True):
+    with SessionLocal() as db:
+        snap = db.get(Snapshot, plan_id)
+        if not snap:
+            raise HTTPException(404, "No snapshot for this plan")
+        cells = snap.grid or []
+        if reset_done:
+            def _clear_flags(acts):
+                return [_set_done_flag_value(s, False) for s in (acts or [])]
+            cells = [{"area": c["area"], "day": c["day"], "activities": _clear_flags(c.get("activities"))} for c in cells]
+        _overwrite_grid(db, plan_id, cells)
+        db.query(RolloverLog).filter(RolloverLog.plan_id == plan_id).delete()
+        db.commit()
+        return {"ok": True, "plan_id": plan_id, "restored_cells": len(cells)}
+
+@ops.post("/checklist_reset_all", dependencies=[Depends(require_key)])
+def checklist_reset_all(plan_id: str = DEFAULT_PLAN_ID):
+    with SessionLocal() as db:
+        rows = db.query(Cell).filter_by(plan_id=plan_id).all()
+        for row in rows:
+            row.activities = [_set_done_flag_value(s, False) for s in (row.activities or [])]
+        db.commit()
+    return {"ok": True, "plan_id": plan_id}
+
+@ops.post("/rollover_logged", dependencies=[Depends(require_key)])
+def rollover_logged(plan_id: str = DEFAULT_PLAN_ID):
+    with SessionLocal() as db:
+        start = _get_start_date_for_plan(db, plan_id)
+        from_day = _day_for_date(start, _today_local())
+        moved, detail = _rollover_incomplete_with_detail(db, plan_id, from_day)
+        log = RolloverLog(plan_id=plan_id, from_day=from_day, to_day=from_day+1, moved=detail)
+        db.add(log)
+        db.commit()
+        return {"ok": True, "log_id": log.id, "moved": moved, "from_day": from_day, "to_day": from_day + 1}
+
+@ops.post("/unrollover_last", dependencies=[Depends(require_key)])
+def unrollover_last(plan_id: str = DEFAULT_PLAN_ID):
+    with SessionLocal() as db:
+        log = db.query(RolloverLog).filter(RolloverLog.plan_id == plan_id)\
+                                   .order_by(RolloverLog.id.desc()).first()
+        if not log:
+            raise HTTPException(404, "No rollover to undo")
+
+        from_day, to_day = log.from_day, log.to_day
+        detail = log.moved or []
+
+        for entry in detail:
+            area = entry["area"]
+            items = entry.get("items") or []
+
+            # Remove items from to_day
+            dest = db.query(Cell).filter_by(plan_id=plan_id, area=area, day=to_day).one_or_none()
+            dest_list = list(dest.activities or []) if dest else []
+            dest_can = [_canon(s) for s in dest_list]
+
+            for moved_item in items:
+                mc = _canon(moved_item)
+                try:
+                    idx = dest_can.index(mc)
+                    dest_can.pop(idx)
+                    dest_list.pop(idx)
+                except ValueError:
+                    pass  # already edited; skip
+
+            if dest:
+                dest.activities = dest_list
+
+            # Append back to from_day
+            src = db.query(Cell).filter_by(plan_id=plan_id, area=area, day=from_day).one_or_none()
+            if src:
+                src.activities = list(src.activities or []) + items
+            else:
+                db.add(Cell(plan_id=plan_id, area=area, day=from_day, activities=list(items)))
+
+        db.delete(log)
+        db.commit()
+
+        return {
+            "ok": True,
+            "undone_log_id": log.id,
+            "from_day": from_day,
+            "to_day": to_day,
+            "moved_back": sum(len(e.get("items") or []) for e in detail)
+        }
+
+# Mount ops router
 app.include_router(ops)
 
 # =========================
