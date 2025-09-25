@@ -287,52 +287,57 @@ def _rollover_incomplete_with_detail(db: Session, plan_id: str, from_day: int):
 # =========================
 @ops.post("/checklist_mark")
 def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
-    # Token is expected as a query param: /ops/checklist_mark?token=XXXXXX
+    # token comes from query: /ops/checklist_mark?token=XXXX
     if not CHECK_TOKEN or token != CHECK_TOKEN:
         raise HTTPException(401, "Invalid token")
 
+    plan = db.get(Plan, payload.plan_id)
+    if not plan:
+        raise HTTPException(404, "Plan not found")
+    total_days = int(plan.total_days or 60)
+
+    total_moved = 0
+
     for upd in payload.updates:
-        row = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=upd.day).one_or_none()
+        # source cell (area, day)
+        row = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=int(upd.day)).one_or_none()
         if not row:
             continue
+
         acts = list(row.activities or [])
+        done_idx   = sorted(set(upd.done or []))
+        undone_idx = sorted(set(upd.undone or []), reverse=True)  # pop from end first
 
-        # Mark done
-        for idx in set(upd.done or []):
-            if 0 <= idx < len(acts):
-                raw = acts[idx]
-                try:
-                    d = json.loads(raw) if isinstance(raw, str) else dict(raw)
-                except Exception:
-                    d = {"name": str(raw)}
-                style_compact = any(k in d for k in ("n", "r", "w", "h")) and ("name" not in d)
-                if style_compact:
-                    d["x"] = True
-                else:
-                    d["done"] = True
-                acts[idx] = json.dumps(d, ensure_ascii=False)
+        # 1) mark DONE items in-place
+        for i in done_idx:
+            if 0 <= i < len(acts):
+                acts[i] = _set_done_flag_value(acts[i], True)
 
-        # Mark NOT done
-        for idx in set(upd.undone or []):
-            if 0 <= idx < len(acts):
-                raw = acts[idx]
-                try:
-                    d = json.loads(raw) if isinstance(raw, str) else dict(raw)
-                except Exception:
-                    d = {"name": str(raw)}
-                style_compact = any(k in d for k in ("n", "r", "w", "h")) and ("name" not in d)
-                if style_compact:
-                    d["x"]  = False
-                    d["d"]  = False
-                    d["dd"] = False
-                else:
-                    d["done"] = False
-                acts[idx] = json.dumps(d, ensure_ascii=False)
+        # 2) move UN-DONE items to next day, ensure done=false
+        to_day = min(int(upd.day) + 1, total_days)
+        dest = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=to_day).one_or_none()
+        dest_list = list(dest.activities or []) if dest else []
 
+        moved_here = 0
+        for i in undone_idx:
+            if 0 <= i < len(acts):
+                raw = acts.pop(i)
+                raw = _set_done_flag_value(raw, False)
+                dest_list.append(raw)
+                moved_here += 1
+
+        if dest:
+            dest.activities = dest_list
+        elif moved_here:
+            db.add(Cell(plan_id=payload.plan_id, area=upd.area, day=to_day, activities=dest_list))
+
+        # write back remaining items to source day
         row.activities = acts
+        total_moved += moved_here
 
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "moved": total_moved}
+
 
 # =========================
 # Email builders + senders
