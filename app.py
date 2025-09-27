@@ -312,6 +312,7 @@ def _rollover_incomplete_with_detail(db: Session, plan_id: str, from_day: int):
 # =========================
 @ops.post("/checklist_mark")
 def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
+    # token comes from query: /ops/checklist_mark?token=XXXX
     if not CHECK_TOKEN or token != CHECK_TOKEN:
         raise HTTPException(401, "Invalid token")
 
@@ -320,43 +321,57 @@ def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: 
         raise HTTPException(404, "Plan not found")
     total_days = int(plan.total_days or 60)
 
+    # Figure out what “today” is in plan-day numbering
+    start_date = _get_start_date_for_plan(db, payload.plan_id)
+    today_day = _day_for_date(start_date, _today_local())
+
     total_moved = 0
 
     for upd in payload.updates:
+        # source cell (area, day)
         row = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=int(upd.day)).one_or_none()
         if not row:
             continue
 
         acts = list(row.activities or [])
         done_idx   = sorted(set(upd.done or []))
-        undone_idx = sorted(set(upd.undone or []), reverse=True)
+        undone_idx = sorted(set(upd.undone or []), reverse=True)  # pop from end first
 
+        # 1) mark DONE items in-place (allowed for any day)
         for i in done_idx:
             if 0 <= i < len(acts):
                 acts[i] = _set_done_flag_value(acts[i], True)
 
-        to_day = min(int(upd.day) + 1, total_days)
-        dest = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=to_day).one_or_none()
-        dest_list = list(dest.activities or []) if dest else []
-
         moved_here = 0
-        for i in undone_idx:
-            if 0 <= i < len(acts):
-                raw = acts.pop(i)
-                raw = _set_done_flag_value(raw, False)
-                dest_list.append(raw)
-                moved_here += 1
 
-        if dest:
-            dest.activities = dest_list
-        elif moved_here:
-            db.add(Cell(plan_id=payload.plan_id, area=upd.area, day=to_day, activities=dest_list))
+        # 2) Only move UN-DONE items if this update is for *today*.
+        #    For future days, ignore "undone" completely to avoid wiping them out.
+        if int(upd.day) == int(today_day):
+            to_day = min(int(upd.day) + 1, total_days)
+            dest = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=to_day).one_or_none()
+            dest_list = list(dest.activities or []) if dest else []
 
+            for i in undone_idx:
+                if 0 <= i < len(acts):
+                    raw = acts.pop(i)
+                    raw = _set_done_flag_value(raw, False)
+                    dest_list.append(raw)
+                    moved_here += 1
+
+            if dest:
+                dest.activities = dest_list
+            elif moved_here:
+                db.add(Cell(plan_id=payload.plan_id, area=upd.area, day=to_day, activities=dest_list))
+
+            total_moved += moved_here
+        # else: not today -> do not move anything; leave acts as-is
+
+        # write back remaining items to source day
         row.activities = acts
-        total_moved += moved_here
 
     db.commit()
-    return {"ok": True, "moved": total_moved}
+    return {"ok": True, "moved": total_moved, "today_day": today_day}
+
 
 # =========================
 # Email builders + senders
