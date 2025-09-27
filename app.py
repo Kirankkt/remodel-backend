@@ -16,7 +16,7 @@ from pydantic import BaseModel, conint
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, JSON, Boolean,
-    DateTime, UniqueConstraint, ForeignKey, func
+    DateTime, Date, UniqueConstraint, ForeignKey, func  # <-- Date added
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
 
@@ -64,6 +64,7 @@ class Plan(Base):
     total_days = Column(Integer, default=60)
     areas = Column(JSON, default=[])
     allow_multiple = Column(Boolean, default=False)
+    start_date = Column(Date, nullable=True)  # <-- NEW: persisted project start date
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     cells = relationship("Cell", cascade="all, delete-orphan", back_populates="plan")
 
@@ -130,6 +131,7 @@ class PlanUpsert(BaseModel):
     total_days: conint(ge=1) = 60
     areas: List[str]
     allow_multiple: bool = False
+    start_date: Optional[date] = None  # <-- NEW
 
 class CellIn(BaseModel):
     area: str
@@ -159,6 +161,10 @@ def _today_local() -> date:
     return datetime.now().date()
 
 def _get_start_date_for_plan(db: Session, plan_id: str) -> date:
+    # Prefer the plan's persisted start_date if available
+    p = db.get(Plan, plan_id)
+    if p and p.start_date:
+        return p.start_date
     if PROJECT_START_DATE:
         return datetime.strptime(PROJECT_START_DATE, "%Y-%m-%d").date()
     return _today_local()
@@ -503,8 +509,9 @@ def create_or_update_plan(payload: PlanUpsert, db: Session = Depends(get_db)):
         p.total_days = payload.total_days
         p.areas = payload.areas
         p.allow_multiple = payload.allow_multiple
+        p.start_date = payload.start_date          # <-- NEW
     else:
-        p = Plan(**payload.dict())
+        p = Plan(**payload.dict())                 # includes start_date
         db.add(p)
     db.commit()
     return payload
@@ -514,7 +521,10 @@ def get_plan(plan_id: str, db: Session = Depends(get_db)):
     p = db.get(Plan, plan_id)
     if not p:
         raise HTTPException(404, "Plan not found")
-    return PlanUpsert(id=p.id, name=p.name, total_days=p.total_days, areas=p.areas, allow_multiple=p.allow_multiple)
+    return PlanUpsert(
+        id=p.id, name=p.name, total_days=p.total_days, areas=p.areas,
+        allow_multiple=p.allow_multiple, start_date=p.start_date  # <-- NEW
+    )
 
 @app.get("/plans/{plan_id}/grid")
 def get_grid(plan_id: str, db: Session = Depends(get_db)):
@@ -699,6 +709,22 @@ def unrollover_last(plan_id: str = DEFAULT_PLAN_ID):
             "to_day": to_day,
             "moved_back": sum(len(e.get("items") or []) for e in detail)
         }
+
+# --- NEW: simple admin setter for start_date ---
+@ops.post("/set_start_date", dependencies=[Depends(require_key)])
+def set_start_date(plan_id: str = DEFAULT_PLAN_ID, start: str = ""):
+    """Set the plan’s start_date (YYYY-MM-DD)."""
+    try:
+        d = datetime.strptime(start, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(400, "start must be YYYY-MM-DD")
+    with SessionLocal() as db:
+        p = db.get(Plan, plan_id)
+        if not p:
+            raise HTTPException(404, "Plan not found")
+        p.start_date = d
+        db.commit()
+        return {"ok": True, "plan_id": plan_id, "start_date": str(d)}
 
 # Mount ops router
 app.include_router(ops)
