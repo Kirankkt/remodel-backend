@@ -24,17 +24,15 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
 # ENV / CONFIG
 # =========================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./schedule.db")
-API_KEY      = os.getenv("API_KEY", "changeme")      # must match X-API-Key header
-CHECK_TOKEN  = os.getenv("CHECK_TOKEN", "RMETVM")    # shared-secret for checklist writes
+API_KEY      = os.getenv("API_KEY", "changeme")
+CHECK_TOKEN  = os.getenv("CHECK_TOKEN", "RMETVM")
 
-# Email + report options
 TIMEZONE             = os.getenv("TIMEZONE", "Asia/Kolkata")
 DEFAULT_PLAN_ID      = os.getenv("DEFAULT_PLAN_ID", "default")
-PROJECT_START_DATE   = os.getenv("PROJECT_START_DATE")  # yyyy-mm-dd, optional
+PROJECT_START_DATE   = os.getenv("PROJECT_START_DATE")
 FRONTEND_PUBLIC_BASE = os.getenv("FRONTEND_PUBLIC_BASE", "")
-BACKEND_PUBLIC_BASE  = os.getenv("BACKEND_PUBLIC_BASE", "")  # <- NEW
+BACKEND_PUBLIC_BASE  = os.getenv("BACKEND_PUBLIC_BASE", "")
 
-# SMTP (fallback)
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
@@ -42,7 +40,6 @@ SMTP_PASS = os.getenv("SMTP_PASS")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "")
 DAILY_TO  = [e.strip() for e in os.getenv("DAILY_TO", "").split(",") if e.strip()]
 
-# Resend (preferred on Railway)
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 RESEND_FROM    = os.getenv("RESEND_FROM", SMTP_FROM or (SMTP_USER or ""))
 RESEND_TO      = os.getenv("RESEND_TO", ",".join(DAILY_TO))
@@ -60,12 +57,12 @@ Base = declarative_base()
 
 class Plan(Base):
     __tablename__ = "plans"
-    id = Column(String, primary_key=True)  # e.g., "default"
+    id = Column(String, primary_key=True)
     name = Column(String, nullable=False)
     total_days = Column(Integer, default=60)
     areas = Column(JSON, default=[])
     allow_multiple = Column(Boolean, default=False)
-    start_date = Column(Date, nullable=True)  # persisted project start date
+    start_date = Column(Date, nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     cells = relationship("Cell", cascade="all, delete-orphan", back_populates="plan")
 
@@ -85,15 +82,15 @@ class Snapshot(Base):
     __tablename__ = "snapshots"
     plan_id = Column(String, primary_key=True)
     taken_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    grid = Column(JSON)  # list of {"area","day","activities":[...]}
+    grid = Column(JSON)
 
 class RolloverLog(Base):
     __tablename__ = "rollover_log"
-    id = Column(Integer, primary key=True, autoincrement=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
     plan_id = Column(String, index=True)
     from_day = Column(Integer)
     to_day = Column(Integer)
-    moved = Column(JSON)  # [{"area": str, "items": [activity,...]}]
+    moved = Column(JSON)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 Base.metadata.create_all(engine)
@@ -104,7 +101,10 @@ Base.metadata.create_all(engine)
 app = FastAPI(title="Remodel Planner API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,  # IMPORTANT: no credentials with wildcard origin
 )
 
 def get_db():
@@ -186,9 +186,7 @@ def _upsert_cell(db: Session, plan_id: str, area: str, day: int, acts: List[str]
     else:
         db.add(Cell(plan_id=plan_id, area=area, day=day, activities=acts))
 
-# --- append-only helper used by rollover ---
 def _append_to_cell(db: Session, plan_id: str, area: str, day: int, items: List[str]):
-    """Append items to (plan_id, area, day) without overwriting existing content."""
     if not items:
         return
     dest = db.query(Cell).filter_by(plan_id=plan_id, area=area, day=day).one_or_none()
@@ -207,13 +205,11 @@ def _normalize_task(obj_or_json):
         t = json.loads(obj_or_json) if isinstance(obj_or_json, str) else dict(obj_or_json or {})
     except Exception:
         return {"name": str(obj_or_json), "role": "", "workers": 0, "hours": 0, "done": False}
-
     name    = t.get("name") or t.get("task") or t.get("n") or ""
     role    = t.get("role") or t.get("r") or ""
     workers = t.get("workers", t.get("w", 0)) or 0
     hours   = t.get("hours", t.get("h", 0)) or 0
     done    = bool(t.get("done") or t.get("d") or t.get("x") or t.get("dd"))
-
     return {"name": name, "role": role, "workers": int(workers), "hours": int(hours), "done": done}
 
 # =========================
@@ -262,10 +258,8 @@ def _canon(x):
 # Rollover (append-only)
 # =========================
 def _rollover_incomplete(db: Session, plan_id: str, from_day: int) -> int:
-    """Move NOT-done tasks from from_day -> from_day+1 (append, never overwrite)."""
     to_day = from_day + 1
     src_rows = db.query(Cell).filter_by(plan_id=plan_id, day=from_day).all()
-
     moved = 0
     for row in src_rows:
         acts = list(row.activities or [])
@@ -279,18 +273,14 @@ def _rollover_incomplete(db: Session, plan_id: str, from_day: int) -> int:
         if carry:
             _append_to_cell(db, plan_id, row.area, to_day, carry)
             moved += len(carry)
-
     db.commit()
     return moved
 
 def _rollover_incomplete_with_detail(db: Session, plan_id: str, from_day: int):
-    """Same as rollover but returns exact items moved for undo."""
     to_day = from_day + 1
     src_rows = db.query(Cell).filter_by(plan_id=plan_id, day=from_day).all()
-
     moved = 0
     detail = []
-
     for row in src_rows:
         acts = list(row.activities or [])
         keep, carry = [], []
@@ -304,7 +294,6 @@ def _rollover_incomplete_with_detail(db: Session, plan_id: str, from_day: int):
             _append_to_cell(db, plan_id, row.area, to_day, carry)
             detail.append({"area": row.area, "items": carry})
             moved += len(carry)
-
     db.commit()
     return moved, detail
 
@@ -313,7 +302,6 @@ def _rollover_incomplete_with_detail(db: Session, plan_id: str, from_day: int):
 # =========================
 @ops.post("/checklist_mark")
 def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
-    # token comes from query: /ops/checklist_mark?token=XXXX
     if not CHECK_TOKEN or token != CHECK_TOKEN:
         raise HTTPException(401, "Invalid token")
 
@@ -322,12 +310,10 @@ def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: 
         raise HTTPException(404, "Plan not found")
     total_days = int(plan.total_days or 60)
 
-    # Figure out what “today” is in plan-day numbering
     start_date = _get_start_date_for_plan(db, payload.plan_id)
     today_day = _day_for_date(start_date, _today_local())
 
     total_moved = 0
-
     for upd in payload.updates:
         row = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=int(upd.day)).one_or_none()
         if not row:
@@ -335,36 +321,29 @@ def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: 
 
         acts = list(row.activities or [])
         done_idx   = sorted(set(upd.done or []))
-        undone_idx = sorted(set(upd.undone or []), reverse=True)  # pop from end first
+        undone_idx = sorted(set(upd.undone or []), reverse=True)
 
-        # 1) mark DONE items in-place
         for i in done_idx:
             if 0 <= i < len(acts):
                 acts[i] = _set_done_flag_value(acts[i], True)
 
         moved_here = 0
-
-        # 2) Move UN-DONE items only for *today*
         if int(upd.day) == int(today_day):
             to_day = min(int(upd.day) + 1, total_days)
             dest = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=to_day).one_or_none()
             dest_list = list(dest.activities or []) if dest else []
-
             for i in undone_idx:
                 if 0 <= i < len(acts):
                     raw = acts.pop(i)
                     raw = _set_done_flag_value(raw, False)
                     dest_list.append(raw)
                     moved_here += 1
-
             if dest:
                 dest.activities = dest_list
             elif moved_here:
                 db.add(Cell(plan_id=payload.plan_id, area=upd.area, day=to_day, activities=dest_list))
-
             total_moved += moved_here
 
-        # write back remaining items to source day
         row.activities = acts
 
     db.commit()
@@ -392,7 +371,6 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
                 "done": "yes" if nt["done"] else ""
             })
 
-    # CSV
     csv_buf = io.StringIO()
     writer = csv.DictWriter(csv_buf, fieldnames=["date", "day", "area", "task", "role", "workers", "hours", "done"])
     writer.writeheader()
@@ -400,7 +378,6 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
         writer.writerow(r)
     csv_bytes = csv_buf.getvalue().encode("utf-8")
 
-    # HTML
     by_day = {}
     for r in rows:
         by_day.setdefault(int(r["day"]), []).append(r)
@@ -426,7 +403,6 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
         section.append("</table>")
         sections.append("\n".join(section))
 
-    # Checklist link now carries &api=BACKEND_PUBLIC_BASE so the page posts to the right origin
     checklist_link = (
         FRONTEND_PUBLIC_BASE and
         f"{FRONTEND_PUBLIC_BASE}/checklist.html?plan={plan_id}&startDay={start_day}&days={span}"
@@ -706,7 +682,6 @@ def unrollover_last(plan_id: str = DEFAULT_PLAN_ID):
             "moved_back": sum(len(e.get("items") or []) for e in detail)
         }
 
-# --- simple admin setter for start_date ---
 @ops.post("/set_start_date", dependencies=[Depends(require_key)])
 def set_start_date(plan_id: str = DEFAULT_PLAN_ID, start: str = ""):
     try:
@@ -721,11 +696,10 @@ def set_start_date(plan_id: str = DEFAULT_PLAN_ID, start: str = ""):
         db.commit()
         return {"ok": True, "plan_id": plan_id, "start_date": str(d)}
 
-# Mount ops router
 app.include_router(ops)
 
 # =========================
-# Optional in-process scheduler (07:00 email, 19:00 rollover)
+# Optional scheduler (07:00 email, 19:00 rollover)
 # =========================
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
