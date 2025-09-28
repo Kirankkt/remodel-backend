@@ -31,7 +31,7 @@ TIMEZONE             = os.getenv("TIMEZONE", "Asia/Kolkata")
 DEFAULT_PLAN_ID      = os.getenv("DEFAULT_PLAN_ID", "default")
 PROJECT_START_DATE   = os.getenv("PROJECT_START_DATE")
 FRONTEND_PUBLIC_BASE = os.getenv("FRONTEND_PUBLIC_BASE", "")
-BACKEND_PUBLIC_BASE  = os.getenv("BACKEND_PUBLIC_BASE", "")
+BACKEND_PUBLIC_BASE  = os.getenv("BACKEND_PUBLIC_BASE", "")  # <-- used in email link (&api=)
 
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -104,7 +104,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=False,  # IMPORTANT: no credentials with wildcard origin
+    allow_credentials=False,   # <— wildcard origin + no credentials avoids CORS errors
 )
 
 def get_db():
@@ -298,22 +298,23 @@ def _rollover_incomplete_with_detail(db: Session, plan_id: str, from_day: int):
     return moved, detail
 
 # =========================
-# Checklist write endpoint
+# Checklist write endpoint  (NO rollover here)
 # =========================
 @ops.post("/checklist_mark")
 def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
+    """
+    Save checklist state only:
+      - indexes in `done`  -> mark done=true
+      - indexes in `undone`-> mark done=false
+    No movement between days happens here anymore.
+    """
     if not CHECK_TOKEN or token != CHECK_TOKEN:
         raise HTTPException(401, "Invalid token")
 
     plan = db.get(Plan, payload.plan_id)
     if not plan:
         raise HTTPException(404, "Plan not found")
-    total_days = int(plan.total_days or 60)
 
-    start_date = _get_start_date_for_plan(db, payload.plan_id)
-    today_day = _day_for_date(start_date, _today_local())
-
-    total_moved = 0
     for upd in payload.updates:
         row = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=int(upd.day)).one_or_none()
         if not row:
@@ -321,33 +322,19 @@ def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: 
 
         acts = list(row.activities or [])
         done_idx   = sorted(set(upd.done or []))
-        undone_idx = sorted(set(upd.undone or []), reverse=True)
+        undone_idx = sorted(set(upd.undone or []))
 
         for i in done_idx:
             if 0 <= i < len(acts):
                 acts[i] = _set_done_flag_value(acts[i], True)
-
-        moved_here = 0
-        if int(upd.day) == int(today_day):
-            to_day = min(int(upd.day) + 1, total_days)
-            dest = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=to_day).one_or_none()
-            dest_list = list(dest.activities or []) if dest else []
-            for i in undone_idx:
-                if 0 <= i < len(acts):
-                    raw = acts.pop(i)
-                    raw = _set_done_flag_value(raw, False)
-                    dest_list.append(raw)
-                    moved_here += 1
-            if dest:
-                dest.activities = dest_list
-            elif moved_here:
-                db.add(Cell(plan_id=payload.plan_id, area=upd.area, day=to_day, activities=dest_list))
-            total_moved += moved_here
+        for i in undone_idx:
+            if 0 <= i < len(acts):
+                acts[i] = _set_done_flag_value(acts[i], False)
 
         row.activities = acts
 
     db.commit()
-    return {"ok": True, "moved": total_moved, "today_day": today_day}
+    return {"ok": True, "moved": 0}
 
 # =========================
 # Email builders + senders
@@ -696,14 +683,17 @@ def set_start_date(plan_id: str = DEFAULT_PLAN_ID, start: str = ""):
         db.commit()
         return {"ok": True, "plan_id": plan_id, "start_date": str(d)}
 
+# ---- scheduler: 07:00 email & 00:00 rollover in configured TIMEZONE ----
 app.include_router(ops)
 
-# =========================
-# Optional scheduler (07:00 email, 19:00 rollover)
-# =========================
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
+    try:
+        from zoneinfo import ZoneInfo
+        TZ = ZoneInfo(TIMEZONE)
+    except Exception:
+        TZ = None
     HAVE_SCHEDULER = True
 except Exception:
     HAVE_SCHEDULER = False
@@ -735,8 +725,8 @@ if HAVE_SCHEDULER:
             except Exception as e:
                 print("Evening rollover failed:", e)
 
-        scheduler.add_job(job_email,    CronTrigger(hour=7,  minute=0))
-        scheduler.add_job(job_rollover, CronTrigger(hour=19, minute=0))
+        scheduler.add_job(job_email,    CronTrigger(hour=7,  minute=0, timezone=TZ))
+        scheduler.add_job(job_rollover, CronTrigger(hour=0,  minute=0, timezone=TZ))  # midnight
         scheduler.start()
     except Exception as e:
         print("Scheduler not started:", e)
