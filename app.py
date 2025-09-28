@@ -32,6 +32,7 @@ TIMEZONE             = os.getenv("TIMEZONE", "Asia/Kolkata")
 DEFAULT_PLAN_ID      = os.getenv("DEFAULT_PLAN_ID", "default")
 PROJECT_START_DATE   = os.getenv("PROJECT_START_DATE")  # yyyy-mm-dd, optional
 FRONTEND_PUBLIC_BASE = os.getenv("FRONTEND_PUBLIC_BASE", "")
+BACKEND_PUBLIC_BASE  = os.getenv("BACKEND_PUBLIC_BASE", "")  # <- NEW
 
 # SMTP (fallback)
 SMTP_HOST = os.getenv("SMTP_HOST")
@@ -88,7 +89,7 @@ class Snapshot(Base):
 
 class RolloverLog(Base):
     __tablename__ = "rollover_log"
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(Integer, primary key=True, autoincrement=True)
     plan_id = Column(String, index=True)
     from_day = Column(Integer)
     to_day = Column(Integer)
@@ -328,7 +329,6 @@ def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: 
     total_moved = 0
 
     for upd in payload.updates:
-        # source cell (area, day)
         row = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=int(upd.day)).one_or_none()
         if not row:
             continue
@@ -337,15 +337,14 @@ def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: 
         done_idx   = sorted(set(upd.done or []))
         undone_idx = sorted(set(upd.undone or []), reverse=True)  # pop from end first
 
-        # 1) mark DONE items in-place (allowed for any day)
+        # 1) mark DONE items in-place
         for i in done_idx:
             if 0 <= i < len(acts):
                 acts[i] = _set_done_flag_value(acts[i], True)
 
         moved_here = 0
 
-        # 2) Only move UN-DONE items if this update is for *today*.
-        #    For future days, ignore "undone" completely to avoid wiping them out.
+        # 2) Move UN-DONE items only for *today*
         if int(upd.day) == int(today_day):
             to_day = min(int(upd.day) + 1, total_days)
             dest = db.query(Cell).filter_by(plan_id=payload.plan_id, area=upd.area, day=to_day).one_or_none()
@@ -364,14 +363,12 @@ def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: 
                 db.add(Cell(plan_id=payload.plan_id, area=upd.area, day=to_day, activities=dest_list))
 
             total_moved += moved_here
-        # else: not today -> do not move anything; leave acts as-is
 
         # write back remaining items to source day
         row.activities = acts
 
     db.commit()
     return {"ok": True, "moved": total_moved, "today_day": today_day}
-
 
 # =========================
 # Email builders + senders
@@ -429,10 +426,12 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
         section.append("</table>")
         sections.append("\n".join(section))
 
+    # Checklist link now carries &api=BACKEND_PUBLIC_BASE so the page posts to the right origin
     checklist_link = (
         FRONTEND_PUBLIC_BASE and
         f"{FRONTEND_PUBLIC_BASE}/checklist.html?plan={plan_id}&startDay={start_day}&days={span}"
         + (f"&t={CHECK_TOKEN}" if CHECK_TOKEN else "")
+        + (f"&api={BACKEND_PUBLIC_BASE}" if BACKEND_PUBLIC_BASE else "")
     )
 
     html = f"""
