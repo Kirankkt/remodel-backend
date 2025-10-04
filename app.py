@@ -23,26 +23,44 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
 # =========================
 # ENV / CONFIG
 # =========================
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./schedule.db")
-API_KEY      = os.getenv("API_KEY", "changeme")
-CHECK_TOKEN  = os.getenv("CHECK_TOKEN", "RMETVM")
 
-TIMEZONE             = os.getenv("TIMEZONE", "Asia/Kolkata")
-DEFAULT_PLAN_ID      = os.getenv("DEFAULT_PLAN_ID", "default")
-PROJECT_START_DATE   = os.getenv("PROJECT_START_DATE")
-FRONTEND_PUBLIC_BASE = os.getenv("FRONTEND_PUBLIC_BASE", "")
-BACKEND_PUBLIC_BASE  = os.getenv("BACKEND_PUBLIC_BASE", "")  # <-- used in email link (&api=)
+def _env(name: str, default: str = "") -> str:
+    """
+    Read an env var and strip surrounding single/double quotes, if any.
+    Railway UI often stores `"value"` which breaks Authorization headers.
+    """
+    v = os.getenv(name, default)
+    if v is None:
+        return default
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1].strip()
+    return v
 
-SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASS = os.getenv("SMTP_PASS")
-SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "")
-DAILY_TO  = [e.strip() for e in os.getenv("DAILY_TO", "").split(",") if e.strip()]
+DATABASE_URL = _env("DATABASE_URL", "sqlite:///./schedule.db")
+API_KEY      = _env("API_KEY", "changeme")
+CHECK_TOKEN  = _env("CHECK_TOKEN", "RMETVM")
 
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-RESEND_FROM    = os.getenv("RESEND_FROM", SMTP_FROM or (SMTP_USER or ""))
-RESEND_TO      = os.getenv("RESEND_TO", ",".join(DAILY_TO))
+TIMEZONE             = _env("TIMEZONE", "Asia/Kolkata")
+DEFAULT_PLAN_ID      = _env("DEFAULT_PLAN_ID", "default")
+PROJECT_START_DATE   = _env("PROJECT_START_DATE")
+FRONTEND_PUBLIC_BASE = _env("FRONTEND_PUBLIC_BASE", "")
+BACKEND_PUBLIC_BASE  = _env("BACKEND_PUBLIC_BASE", "")  # <-- used in email link (&api=)
+
+SMTP_HOST = _env("SMTP_HOST")
+SMTP_PORT = int(_env("SMTP_PORT", "587") or "587")
+SMTP_USER = _env("SMTP_USER")
+SMTP_PASS = _env("SMTP_PASS")
+SMTP_FROM = _env("SMTP_FROM", SMTP_USER or "")
+
+# allow comma OR semicolon separated recipients
+DAILY_TO  = [e.strip() for e in _env("DAILY_TO", "").replace(";", ",").split(",") if e.strip()]
+
+RESEND_API_KEY = _env("RESEND_API_KEY")
+RESEND_FROM    = _env("RESEND_FROM", SMTP_FROM or (SMTP_USER or ""))
+# keep as string here; we'll split when sending
+RESEND_TO      = _env("RESEND_TO", ",".join(DAILY_TO))
+
 
 # =========================
 # DB setup
@@ -425,7 +443,9 @@ def _send_via_smtp(subject: str, html: str, csv_bytes: bytes, csv_name="tasks.cs
 def _send_via_resend(subject: str, html: str, csv_bytes: bytes, csv_name="tasks.csv"):
     if not RESEND_API_KEY:
         raise RuntimeError("RESEND_API_KEY missing")
-    to_list = [x.strip() for x in (RESEND_TO.split(",") if RESEND_TO else [])]
+    to_source = RESEND_TO or ",".join(DAILY_TO)
+    to_list = [x.strip() for x in to_source.replace(";", ",").split(",") if x.strip()]
+
     if not to_list:
         raise RuntimeError("RESEND_TO (or DAILY_TO) not set")
     payload = {
@@ -438,7 +458,11 @@ def _send_via_resend(subject: str, html: str, csv_bytes: bytes, csv_name="tasks.
             "content": base64.b64encode(csv_bytes).decode("ascii"),
         }],
     }
-    headers = {"Authorization": f"Bearer {RESEND_API_KEY}"}
+    headers = {
+    "Authorization": f"Bearer {RESEND_API_KEY}",
+    "Content-Type": "application/json",
+}
+
     with httpx.Client(timeout=30) as client:
         r = client.post("https://api.resend.com/emails", json=payload, headers=headers)
         r.raise_for_status()
