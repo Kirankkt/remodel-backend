@@ -744,7 +744,7 @@ if HAVE_SCHEDULER:
         scheduler = BackgroundScheduler()
 
         def job_email():
-    try:
+            try:
         with SessionLocal() as db:
             start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
             today_day = max(1, _day_for_date(start_date, _today_local()))
