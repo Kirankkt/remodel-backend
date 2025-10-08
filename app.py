@@ -745,16 +745,16 @@ if HAVE_SCHEDULER:
 
         def job_email():
             try:
-        with SessionLocal() as db:
-            start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
-            today_day = max(1, _day_for_date(start_date, _today_local()))
-            html, csv_bytes = _build_three_day_report(db, DEFAULT_PLAN_ID, today_day, span=3)
-            _send_email(
-                subject=f"[{DEFAULT_PLAN_ID}] 3-day checklist (Day {today_day}–{today_day+2})",
-                html=html, csv_bytes=csv_bytes, csv_name=f"checklist_day{today_day}.csv"
-            )
-    except Exception as e:
-        print("Morning email failed:", e)
+                with SessionLocal() as db:
+                    start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
+                    today_day = max(1, _day_for_date(start_date, _today_local()))
+                    html, csv_bytes = _build_three_day_report(db, DEFAULT_PLAN_ID, today_day, span=3)
+                    _send_email(
+                        subject=f"[{DEFAULT_PLAN_ID}] 3-day checklist (Day {today_day}–{today_day+2})",
+                        html=html, csv_bytes=csv_bytes, csv_name=f"checklist_day{today_day}.csv"
+                    )
+            except Exception as e:
+                print("Morning email failed:", e)
 
         def job_rollover():
             try:
