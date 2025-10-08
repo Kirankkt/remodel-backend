@@ -171,9 +171,16 @@ class ChecklistUpdateIn(BaseModel):
 # =========================
 # Utilities
 # =========================
-def _today_local() -> date:
-    return datetime.now().date()
 
+def _today_local() -> date:
+    """Return 'today' in the configured TIMEZONE (falls back to server local)."""
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(TIMEZONE)  # e.g., "Asia/Kolkata"
+        return datetime.now(tz).date()
+    except Exception:
+        return datetime.now().date()
+        
 def _get_start_date_for_plan(db: Session, plan_id: str) -> date:
     p = db.get(Plan, plan_id)
     if p and p.start_date:
@@ -366,7 +373,8 @@ def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: 
 # Email builders + senders
 # =========================
 def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int = 3):
-    start_date = _get_start_date_for_plan(db, plan_id)
+    # ensure we never render "Day 0" or negatives
+    start_day = max(1, int(start_day))
     cells = _fetch_cells_range(db, plan_id, start_day, start_day + span - 1)
 
     rows = []
@@ -580,7 +588,8 @@ def send_daily_email(plan_id: str = DEFAULT_PLAN_ID, span: int = 3):
     try:
         with SessionLocal() as db:
             start_date = _get_start_date_for_plan(db, plan_id)
-            today_day = _day_for_date(start_date, _today_local())
+            # compute "today" in configured timezone and never below Day 1
+            today_day = max(1, _day_for_date(start_date, _today_local()))
             html, csv_bytes = _build_three_day_report(db, plan_id, today_day, span=span)
             _send_email(
                 subject=f"[{plan_id}] {span}-day checklist (Day {today_day}–{today_day+span-1})",
@@ -735,23 +744,23 @@ if HAVE_SCHEDULER:
         scheduler = BackgroundScheduler()
 
         def job_email():
-            try:
-                with SessionLocal() as db:
-                    start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
-                    today_day = _day_for_date(start_date, _today_local())
-                    html, csv_bytes = _build_three_day_report(db, DEFAULT_PLAN_ID, today_day, span=3)
-                    _send_email(
-                        subject=f"[{DEFAULT_PLAN_ID}] 3-day checklist (Day {today_day}–{today_day+2})",
-                        html=html, csv_bytes=csv_bytes, csv_name=f"checklist_day{today_day}.csv"
-                    )
-            except Exception as e:
-                print("Morning email failed:", e)
+    try:
+        with SessionLocal() as db:
+            start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
+            today_day = max(1, _day_for_date(start_date, _today_local()))
+            html, csv_bytes = _build_three_day_report(db, DEFAULT_PLAN_ID, today_day, span=3)
+            _send_email(
+                subject=f"[{DEFAULT_PLAN_ID}] 3-day checklist (Day {today_day}–{today_day+2})",
+                html=html, csv_bytes=csv_bytes, csv_name=f"checklist_day{today_day}.csv"
+            )
+    except Exception as e:
+        print("Morning email failed:", e)
 
         def job_rollover():
             try:
                 with SessionLocal() as db:
                     start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
-                    from_day = _day_for_date(start_date, _today_local())
+                    from_day = max(1, _day_for_date(start_date, _today_local()))
                     moved = _rollover_incomplete(db, DEFAULT_PLAN_ID, from_day)
                     print("Rollover moved:", moved)
             except Exception as e:
