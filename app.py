@@ -375,9 +375,7 @@ def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: 
 def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int = 3):
     # ensure we never render "Day 0" or negatives
     start_day = max(1, int(start_day))
-
-    # 🔧 this line was missing — you referenced start_date below
-    start_date = _get_start_date_for_plan(db, plan_id)
+    start_date = _get_start_date_for_plan(db, plan_id)  # <-- FIX: define start_date
 
     cells = _fetch_cells_range(db, plan_id, start_day, start_day + span - 1)
 
