@@ -186,7 +186,15 @@ def _day_for_date(start: date, d: date) -> int:
     return (d - start).days + 1
 
 def _date_for_day(start: date, day: int) -> date:
-    return start + timedelta(days=day - 1)
+    """Return calendar date for a given Day N, skipping Sundays."""
+    dt = start
+    steps = max(0, day - 1)
+    while steps > 0:
+        dt = dt + timedelta(days=1)
+        if dt.weekday() != 6:  # 6 = Sunday
+            steps -= 1
+    return dt
+
 
 def _fetch_cells_range(db: Session, plan_id: str, from_day: int, to_day: int):
     rows = (
