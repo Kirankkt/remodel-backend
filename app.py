@@ -201,27 +201,6 @@ def _date_for_day(start: date, day: int) -> date:
         if dt.weekday() != 6:  # 6 = Sunday
             steps -= 1
     return dt
-def _yesterday_working_date():
-    """
-    Return 'yesterday'. If yesterday is Sunday (weekday==6), use Saturday instead,
-    because your plan skips Sundays.
-    """
-    y = _today_local() - timedelta(days=1)
-    if y.weekday() == 6:  # Sunday
-        y -= timedelta(days=1)
-    return y
-def _working_day_index(start: date, d: date) -> int:
-    """Day N for calendar date d where Day 1 = start, skipping Sundays."""
-    if d <= start:
-        return 1
-    n = 1
-    cur = start
-    while cur < d:
-        cur += timedelta(days=1)
-        if cur.weekday() == 6:  # Sunday
-            continue
-        n += 1
-    return n
 
 
 def _fetch_cells_range(db: Session, plan_id: str, from_day: int, to_day: int):
@@ -612,7 +591,7 @@ def send_daily_email(plan_id: str = DEFAULT_PLAN_ID, span: int = 3):
         with SessionLocal() as db:
             start_date = _get_start_date_for_plan(db, plan_id)
             # compute "today" in configured timezone and never below Day 1
-            today_day = max(1, _working_day_index(start_date, _today_local()))
+            today_day = max(1, _day_for_date(start_date, _today_local()))
             html, csv_bytes = _build_three_day_report(db, plan_id, today_day, span=span)
             _send_email(
                 subject=f"[{plan_id}] {span}-day checklist (Day {today_day}–{today_day+span-1})",
@@ -627,15 +606,11 @@ def rollover(plan_id: str = DEFAULT_PLAN_ID):
     try:
         with SessionLocal() as db:
             start_date = _get_start_date_for_plan(db, plan_id)
-            y = _yesterday_working_date()
-            from_day = _day_for_date(start_date, y)
-            if from_day < 1:
-                return {"ok": True, "moved": 0, "from_day": 0, "to_day": 1}
+            from_day = _day_for_date(start_date, _today_local())
             moved = _rollover_incomplete(db, plan_id, from_day)
             return {"ok": True, "moved": moved, "from_day": from_day, "to_day": from_day + 1}
     except Exception as e:
         raise HTTPException(500, detail=str(e))
-
 
 # =========================
 # Snapshot/reset/undo endpoints
@@ -682,15 +657,11 @@ def checklist_reset_all(plan_id: str = DEFAULT_PLAN_ID):
 def rollover_logged(plan_id: str = DEFAULT_PLAN_ID):
     with SessionLocal() as db:
         start = _get_start_date_for_plan(db, plan_id)
-        y = _yesterday_working_date()
-        from_day = _day_for_date(start, y)
-        if from_day < 1:
-            log = RolloverLog(plan_id=plan_id, from_day=0, to_day=1, moved=[])
-            db.add(log); db.commit()
-            return {"ok": True, "log_id": log.id, "moved": 0, "from_day": 0, "to_day": 1}
+        from_day = _day_for_date(start, _today_local())
         moved, detail = _rollover_incomplete_with_detail(db, plan_id, from_day)
         log = RolloverLog(plan_id=plan_id, from_day=from_day, to_day=from_day+1, moved=detail)
-        db.add(log); db.commit()
+        db.add(log)
+        db.commit()
         return {"ok": True, "log_id": log.id, "moved": moved, "from_day": from_day, "to_day": from_day + 1}
 
 @ops.post("/unrollover_last", dependencies=[Depends(require_key)])
@@ -778,7 +749,7 @@ if HAVE_SCHEDULER:
             try:
                 with SessionLocal() as db:
                     start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
-                    today_day = max(1, _working_day_index(start_date, _today_local()))
+                    today_day = max(1, _day_for_date(start_date, _today_local()))
                     html, csv_bytes = _build_three_day_report(db, DEFAULT_PLAN_ID, today_day, span=3)
                     _send_email(
                         subject=f"[{DEFAULT_PLAN_ID}] 3-day checklist (Day {today_day}–{today_day+2})",
@@ -788,23 +759,14 @@ if HAVE_SCHEDULER:
                 print("Morning email failed:", e)
 
         def job_rollover():
-            """
-            Nightly rollover: move unfinished tasks from *yesterday* to *today*.
-            If yesterday is Sunday, use Saturday instead.
-            """
             try:
                 with SessionLocal() as db:
                     start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
-                    y = _yesterday_working_date()
-                    from_day = _day_for_date(start_date, y)
-                    if from_day < 1:
-                        print("Rollover: no previous workday yet (skipping).")
-                        return
+                    from_day = max(1, _day_for_date(start_date, _today_local()))
                     moved = _rollover_incomplete(db, DEFAULT_PLAN_ID, from_day)
-                    print(f"Rollover moved: {moved} (Day {from_day} -> {from_day+1})")
+                    print("Rollover moved:", moved)
             except Exception as e:
                 print("Evening rollover failed:", e)
-        
 
         scheduler.add_job(job_email,    CronTrigger(hour=7,  minute=0, timezone=TZ))
         scheduler.add_job(job_rollover, CronTrigger(hour=0,  minute=0, timezone=TZ))  # midnight
