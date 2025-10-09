@@ -210,6 +210,18 @@ def _yesterday_working_date():
     if y.weekday() == 6:  # Sunday
         y -= timedelta(days=1)
     return y
+def _working_day_index(start: date, d: date) -> int:
+    """Day N for calendar date d where Day 1 = start, skipping Sundays."""
+    if d <= start:
+        return 1
+    n = 1
+    cur = start
+    while cur < d:
+        cur += timedelta(days=1)
+        if cur.weekday() == 6:  # Sunday
+            continue
+        n += 1
+    return n
 
 
 def _fetch_cells_range(db: Session, plan_id: str, from_day: int, to_day: int):
@@ -600,7 +612,7 @@ def send_daily_email(plan_id: str = DEFAULT_PLAN_ID, span: int = 3):
         with SessionLocal() as db:
             start_date = _get_start_date_for_plan(db, plan_id)
             # compute "today" in configured timezone and never below Day 1
-            today_day = max(1, _day_for_date(start_date, _today_local()))
+            today_day = max(1, _working_day_index(start_date, _today_local()))
             html, csv_bytes = _build_three_day_report(db, plan_id, today_day, span=span)
             _send_email(
                 subject=f"[{plan_id}] {span}-day checklist (Day {today_day}–{today_day+span-1})",
@@ -766,7 +778,7 @@ if HAVE_SCHEDULER:
             try:
                 with SessionLocal() as db:
                     start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
-                    today_day = max(1, _day_for_date(start_date, _today_local()))
+                    today_day = max(1, _working_day_index(start_date, _today_local()))
                     html, csv_bytes = _build_three_day_report(db, DEFAULT_PLAN_ID, today_day, span=3)
                     _send_email(
                         subject=f"[{DEFAULT_PLAN_ID}] 3-day checklist (Day {today_day}–{today_day+2})",
