@@ -11,7 +11,7 @@ from email.message import EmailMessage
 import math
 
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Header, APIRouter
+from fastapi import FastAPI, Depends, HTTPException, Header, APIRouter, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, conint
 
@@ -136,6 +136,21 @@ def get_db():
 def require_key(x_api_key: Optional[str] = Header(None)):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(401, "Invalid API key")
+
+# NEW: write-permission guard (admin key OR editor token)
+def require_write(
+    x_api_key: Optional[str] = Header(None),
+    x_edit_token: Optional[str] = Header(None),
+    t: Optional[str] = Query(None),
+):
+    # Admin key always allowed
+    if API_KEY and x_api_key == API_KEY:
+        return
+    # Editor token (header or ?t=) for limited write endpoints
+    token = x_edit_token or t
+    if CHECK_TOKEN and token == CHECK_TOKEN:
+        return
+    raise HTTPException(401, "Need API key or editor token")
 
 ops = APIRouter(prefix="/ops", tags=["ops"])
 
@@ -538,10 +553,13 @@ def get_grid(plan_id: str, db: Session = Depends(get_db)):
     rows = db.query(Cell).filter(Cell.plan_id == plan_id).all()
     return {
         "allowMultiple": p.allow_multiple,
-        "cells": [{"area": c.area, "day": c.day, "activities": c.activities} for c in rows]
+        "cells": [{"area": c.area, "day": c.day, "activities": c.activities} for c in rows],
+        # expose start date so the front-end can keep headers aligned
+        "start_date": (p.start_date.isoformat() if p.start_date else None),
     }
 
-@app.put("/plans/{plan_id}/grid", dependencies=[Depends(require_key)])
+# CHANGED: allow write using admin API key OR editor token
+@app.put("/plans/{plan_id}/grid", dependencies=[Depends(require_write)])
 def upsert_grid(plan_id: str, payload: GridIn, db: Session = Depends(get_db)):
     p = db.get(Plan, plan_id)
     if not p:
