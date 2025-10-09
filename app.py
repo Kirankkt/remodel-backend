@@ -8,6 +8,7 @@ import smtplib
 from typing import List, Optional
 from datetime import datetime, timedelta, date
 from email.message import EmailMessage
+import math
 
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Header, APIRouter
