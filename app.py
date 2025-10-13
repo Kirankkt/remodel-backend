@@ -8,7 +8,6 @@ import smtplib
 from typing import List, Optional
 from datetime import datetime, timedelta, date
 from email.message import EmailMessage
-import math
 
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Header, APIRouter, Query
@@ -26,10 +25,6 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
 # =========================
 
 def _env(name: str, default: str = "") -> str:
-    """
-    Read an env var and strip surrounding single/double quotes, if any.
-    Railway UI often stores `"value"` which breaks Authorization headers.
-    """
     v = os.getenv(name, default)
     if v is None:
         return default
@@ -46,7 +41,7 @@ TIMEZONE             = _env("TIMEZONE", "Asia/Kolkata")
 DEFAULT_PLAN_ID      = _env("DEFAULT_PLAN_ID", "default")
 PROJECT_START_DATE   = _env("PROJECT_START_DATE")
 FRONTEND_PUBLIC_BASE = _env("FRONTEND_PUBLIC_BASE", "")
-BACKEND_PUBLIC_BASE  = _env("BACKEND_PUBLIC_BASE", "")  # <-- used in email link (&api=)
+BACKEND_PUBLIC_BASE  = _env("BACKEND_PUBLIC_BASE", "")
 
 SMTP_HOST = _env("SMTP_HOST")
 SMTP_PORT = int(_env("SMTP_PORT", "587") or "587")
@@ -54,14 +49,11 @@ SMTP_USER = _env("SMTP_USER")
 SMTP_PASS = _env("SMTP_PASS")
 SMTP_FROM = _env("SMTP_FROM", SMTP_USER or "")
 
-# allow comma OR semicolon separated recipients
 DAILY_TO  = [e.strip() for e in _env("DAILY_TO", "").replace(";", ",").split(",") if e.strip()]
 
 RESEND_API_KEY = _env("RESEND_API_KEY")
 RESEND_FROM    = _env("RESEND_FROM", SMTP_FROM or (SMTP_USER or ""))
-# keep as string here; we'll split when sending
 RESEND_TO      = _env("RESEND_TO", ",".join(DAILY_TO))
-
 
 # =========================
 # DB setup
@@ -123,7 +115,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=False,   # <— wildcard origin + no credentials avoids CORS errors
+    allow_credentials=False,
 )
 
 def get_db():
@@ -137,16 +129,14 @@ def require_key(x_api_key: Optional[str] = Header(None)):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(401, "Invalid API key")
 
-# NEW: write-permission guard (admin key OR editor token)
+# write-permission guard (admin key OR editor token)
 def require_write(
     x_api_key: Optional[str] = Header(None),
     x_edit_token: Optional[str] = Header(None),
     t: Optional[str] = Query(None),
 ):
-    # Admin key always allowed
     if API_KEY and x_api_key == API_KEY:
         return
-    # Editor token (header or ?t=) for limited write endpoints
     token = x_edit_token or t
     if CHECK_TOKEN and token == CHECK_TOKEN:
         return
@@ -187,16 +177,14 @@ class ChecklistUpdateIn(BaseModel):
 # =========================
 # Utilities
 # =========================
-
 def _today_local() -> date:
-    """Return 'today' in the configured TIMEZONE (falls back to server local)."""
     try:
         from zoneinfo import ZoneInfo
-        tz = ZoneInfo(TIMEZONE)  # e.g., "Asia/Kolkata"
+        tz = ZoneInfo(TIMEZONE)
         return datetime.now(tz).date()
     except Exception:
         return datetime.now().date()
-        
+
 def _get_start_date_for_plan(db: Session, plan_id: str) -> date:
     p = db.get(Plan, plan_id)
     if p and p.start_date:
@@ -209,15 +197,18 @@ def _day_for_date(start: date, d: date) -> int:
     return (d - start).days + 1
 
 def _date_for_day(start: date, day: int) -> date:
-    """Return calendar date for a given Day N, skipping Sundays."""
+    """Return calendar date for a given Day N, skipping Sundays and the fixed holidays."""
+    HOLIDAYS = {(12, 24), (12, 25), (12, 26), (12, 31), (1, 1)}  # (month, day)
     dt = start
     steps = max(0, day - 1)
     while steps > 0:
         dt = dt + timedelta(days=1)
-        if dt.weekday() != 6:  # 6 = Sunday
-            steps -= 1
+        if dt.weekday() == 6:  # Sunday
+            continue
+        if (dt.month, dt.day) in HOLIDAYS:
+            continue
+        steps -= 1
     return dt
-
 
 def _fetch_cells_range(db: Session, plan_id: str, from_day: int, to_day: int):
     rows = (
@@ -246,9 +237,6 @@ def _append_to_cell(db: Session, plan_id: str, area: str, day: int, items: List[
     else:
         db.add(Cell(plan_id=plan_id, area=area, day=day, activities=list(items)))
 
-# =========================
-# Task normalization
-# =========================
 def _normalize_task(obj_or_json):
     try:
         t = json.loads(obj_or_json) if isinstance(obj_or_json, str) else dict(obj_or_json or {})
@@ -261,9 +249,6 @@ def _normalize_task(obj_or_json):
     done    = bool(t.get("done") or t.get("d") or t.get("x") or t.get("dd"))
     return {"name": name, "role": role, "workers": int(workers), "hours": int(hours), "done": done}
 
-# =========================
-# Snapshot/reset/undo helpers
-# =========================
 def _set_done_flag_value(raw, value: bool):
     try:
         t = json.loads(raw) if isinstance(raw, str) else dict(raw)
@@ -347,16 +332,10 @@ def _rollover_incomplete_with_detail(db: Session, plan_id: str, from_day: int):
     return moved, detail
 
 # =========================
-# Checklist write endpoint  (NO rollover here)
+# Checklist write endpoints
 # =========================
 @ops.post("/checklist_mark")
 def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
-    """
-    Save checklist state only:
-      - indexes in `done`  -> mark done=true
-      - indexes in `undone`-> mark done=false
-    No movement between days happens here anymore.
-    """
     if not CHECK_TOKEN or token != CHECK_TOKEN:
         raise HTTPException(401, "Invalid token")
 
@@ -385,13 +364,56 @@ def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: 
     db.commit()
     return {"ok": True, "moved": 0}
 
+# NEW: update workers/hours from the checklist (token-protected)
+class ChecklistWH(BaseModel):
+    area: str
+    day: conint(ge=1)
+    index: conint(ge=0)
+    workers: Optional[int] = None
+    hours: Optional[int] = None
+
+class WHUpdateIn(BaseModel):
+    plan_id: str = DEFAULT_PLAN_ID
+    items: List[ChecklistWH]
+
+@ops.post("/checklist_update_fields")
+def checklist_update_fields(payload: WHUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
+    if not CHECK_TOKEN or token != CHECK_TOKEN:
+        raise HTTPException(401, "Invalid token")
+
+    plan = db.get(Plan, payload.plan_id)
+    if not plan:
+        raise HTTPException(404, "Plan not found")
+
+    updated = 0
+    for it in payload.items or []:
+        row = db.query(Cell).filter_by(plan_id=payload.plan_id, area=it.area, day=int(it.day)).one_or_none()
+        if not row:
+            continue
+        acts = list(row.activities or [])
+        if it.index < 0 or it.index >= len(acts):
+            continue
+        try:
+            t = json.loads(acts[it.index]) if isinstance(acts[it.index], str) else dict(acts[it.index])
+        except Exception:
+            t = {"name": str(acts[it.index]), "role": "", "workers": 0, "hours": 0, "done": False}
+        if it.workers is not None:
+            t["workers"] = int(it.workers)
+        if it.hours is not None:
+            t["hours"] = int(it.hours)
+        acts[it.index] = json.dumps(t, ensure_ascii=False)
+        row.activities = acts
+        updated += 1
+
+    db.commit()
+    return {"ok": True, "updated": updated}
+
 # =========================
 # Email builders + senders
 # =========================
 def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int = 3):
-    # ensure we never render "Day 0" or negatives
     start_day = max(1, int(start_day))
-    start_date = _get_start_date_for_plan(db, plan_id)  # <-- FIX: define start_date
+    start_date = _get_start_date_for_plan(db, plan_id)
 
     cells = _fetch_cells_range(db, plan_id, start_day, start_day + span - 1)
 
@@ -479,7 +501,6 @@ def _send_via_resend(subject: str, html: str, csv_bytes: bytes, csv_name="tasks.
         raise RuntimeError("RESEND_API_KEY missing")
     to_source = RESEND_TO or ",".join(DAILY_TO)
     to_list = [x.strip() for x in to_source.replace(";", ",").split(",") if x.strip()]
-
     if not to_list:
         raise RuntimeError("RESEND_TO (or DAILY_TO) not set")
     payload = {
@@ -493,10 +514,9 @@ def _send_via_resend(subject: str, html: str, csv_bytes: bytes, csv_name="tasks.
         }],
     }
     headers = {
-    "Authorization": f"Bearer {RESEND_API_KEY}",
-    "Content-Type": "application/json",
-}
-
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json",
+    }
     with httpx.Client(timeout=30) as client:
         r = client.post("https://api.resend.com/emails", json=payload, headers=headers)
         r.raise_for_status()
@@ -554,11 +574,9 @@ def get_grid(plan_id: str, db: Session = Depends(get_db)):
     return {
         "allowMultiple": p.allow_multiple,
         "cells": [{"area": c.area, "day": c.day, "activities": c.activities} for c in rows],
-        # expose start date so the front-end can keep headers aligned
         "start_date": (p.start_date.isoformat() if p.start_date else None),
     }
 
-# CHANGED: allow write using admin API key OR editor token
 @app.put("/plans/{plan_id}/grid", dependencies=[Depends(require_write)])
 def upsert_grid(plan_id: str, payload: GridIn, db: Session = Depends(get_db)):
     p = db.get(Plan, plan_id)
@@ -609,7 +627,6 @@ def send_daily_email(plan_id: str = DEFAULT_PLAN_ID, span: int = 3):
     try:
         with SessionLocal() as db:
             start_date = _get_start_date_for_plan(db, plan_id)
-            # compute "today" in configured timezone and never below Day 1
             today_day = max(1, _day_for_date(start_date, _today_local()))
             html, csv_bytes = _build_three_day_report(db, plan_id, today_day, span=span)
             _send_email(
@@ -788,7 +805,7 @@ if HAVE_SCHEDULER:
                 print("Evening rollover failed:", e)
 
         scheduler.add_job(job_email,    CronTrigger(hour=7,  minute=0, timezone=TZ))
-        scheduler.add_job(job_rollover, CronTrigger(hour=0,  minute=0, timezone=TZ))  # midnight
+        scheduler.add_job(job_rollover, CronTrigger(hour=0,  minute=0, timezone=TZ))
         scheduler.start()
     except Exception as e:
         print("Scheduler not started:", e)
