@@ -1,4 +1,3 @@
-# app.py
 import os
 import csv
 import io
@@ -193,22 +192,32 @@ def _get_start_date_for_plan(db: Session, plan_id: str) -> date:
         return datetime.strptime(PROJECT_START_DATE, "%Y-%m-%d").date()
     return _today_local()
 
-def _day_for_date(start: date, d: date) -> int:
-    return (d - start).days + 1
+# --- OFF-DAYS (Sundays + Dec 24/25/26 + Dec 31 + Jan 1, any year) ---
+OFF_MD = {(12,24), (12,25), (12,26), (12,31), (1,1)}
+
+def _is_off(d: date) -> bool:
+    return d.weekday() == 6 or (d.month, d.day) in OFF_MD
 
 def _date_for_day(start: date, day: int) -> date:
-    """Return calendar date for a given Day N, skipping Sundays and the fixed holidays."""
-    HOLIDAYS = {(12, 24), (12, 25), (12, 26), (12, 31), (1, 1)}  # (month, day)
+    """Map Day N -> calendar date, skipping off-days."""
     dt = start
     steps = max(0, day - 1)
     while steps > 0:
         dt = dt + timedelta(days=1)
-        if dt.weekday() == 6:  # Sunday
-            continue
-        if (dt.month, dt.day) in HOLIDAYS:
-            continue
-        steps -= 1
+        if not _is_off(dt):
+            steps -= 1
     return dt
+
+def _workday_index(start: date, d: date) -> int:
+    """Map a calendar date to its workday index (Day N)."""
+    if d <= start:
+        return 1
+    idx, cur = 1, start
+    while cur < d:
+        cur = cur + timedelta(days=1)
+        if not _is_off(cur):
+            idx += 1
+    return idx
 
 def _fetch_cells_range(db: Session, plan_id: str, from_day: int, to_day: int):
     rows = (
@@ -574,7 +583,7 @@ def get_grid(plan_id: str, db: Session = Depends(get_db)):
     return {
         "allowMultiple": p.allow_multiple,
         "cells": [{"area": c.area, "day": c.day, "activities": c.activities} for c in rows],
-        "start_date": (p.start_date.isoformat() if p.start_date else None),
+        "start_date": (p.start_date.isoformat() if p.start_date else None),  # (C) include start_date
     }
 
 @app.put("/plans/{plan_id}/grid", dependencies=[Depends(require_write)])
@@ -627,7 +636,8 @@ def send_daily_email(plan_id: str = DEFAULT_PLAN_ID, span: int = 3):
     try:
         with SessionLocal() as db:
             start_date = _get_start_date_for_plan(db, plan_id)
-            today_day = max(1, _day_for_date(start_date, _today_local()))
+            # (B) use workday index
+            today_day = max(1, _workday_index(start_date, _today_local()))
             html, csv_bytes = _build_three_day_report(db, plan_id, today_day, span=span)
             _send_email(
                 subject=f"[{plan_id}] {span}-day checklist (Day {today_day}–{today_day+span-1})",
@@ -642,7 +652,8 @@ def rollover(plan_id: str = DEFAULT_PLAN_ID):
     try:
         with SessionLocal() as db:
             start_date = _get_start_date_for_plan(db, plan_id)
-            from_day = _day_for_date(start_date, _today_local())
+            # (B) use workday index
+            from_day = max(1, _workday_index(start_date, _today_local()))
             moved = _rollover_incomplete(db, plan_id, from_day)
             return {"ok": True, "moved": moved, "from_day": from_day, "to_day": from_day + 1}
     except Exception as e:
@@ -693,7 +704,8 @@ def checklist_reset_all(plan_id: str = DEFAULT_PLAN_ID):
 def rollover_logged(plan_id: str = DEFAULT_PLAN_ID):
     with SessionLocal() as db:
         start = _get_start_date_for_plan(db, plan_id)
-        from_day = _day_for_date(start, _today_local())
+        # (B) use workday index
+        from_day = max(1, _workday_index(start, _today_local()))
         moved, detail = _rollover_incomplete_with_detail(db, plan_id, from_day)
         log = RolloverLog(plan_id=plan_id, from_day=from_day, to_day=from_day+1, moved=detail)
         db.add(log)
@@ -785,7 +797,8 @@ if HAVE_SCHEDULER:
             try:
                 with SessionLocal() as db:
                     start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
-                    today_day = max(1, _day_for_date(start_date, _today_local()))
+                    # (B) use workday index
+                    today_day = max(1, _workday_index(start_date, _today_local()))
                     html, csv_bytes = _build_three_day_report(db, DEFAULT_PLAN_ID, today_day, span=3)
                     _send_email(
                         subject=f"[{DEFAULT_PLAN_ID}] 3-day checklist (Day {today_day}–{today_day+2})",
@@ -798,7 +811,8 @@ if HAVE_SCHEDULER:
             try:
                 with SessionLocal() as db:
                     start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
-                    from_day = max(1, _day_for_date(start_date, _today_local()))
+                    # (B) use workday index
+                    from_day = max(1, _workday_index(start_date, _today_local()))
                     moved = _rollover_incomplete(db, DEFAULT_PLAN_ID, from_day)
                     print("Rollover moved:", moved)
             except Exception as e:
