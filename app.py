@@ -811,10 +811,13 @@ if HAVE_SCHEDULER:
             try:
                 with SessionLocal() as db:
                     start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
-                    # (B) use workday index
-                    from_day = max(1, _workday_index(start_date, _today_local()))
+        
+                    # Roll **yesterday → today** using previous workday index
+                    today_idx = _workday_index(start_date, _today_local())
+                    from_day  = max(1, today_idx - 1)
+        
                     moved = _rollover_incomplete(db, DEFAULT_PLAN_ID, from_day)
-                    print("Rollover moved:", moved)
+                    print(f"Rollover moved {moved} item(s) from Day {from_day} → {from_day+1}.")
             except Exception as e:
                 print("Evening rollover failed:", e)
 
