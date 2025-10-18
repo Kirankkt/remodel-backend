@@ -103,6 +103,18 @@ class RolloverLog(Base):
     moved = Column(JSON)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+# ---- NEW: Items & Costs persisted per plan+day ----
+class Extras(Base):
+    __tablename__ = "extras"
+    id = Column(Integer, primary_key=True)
+    plan_id = Column(String, index=True, nullable=False)
+    day = Column(Integer, nullable=False)
+    items = Column(JSON, nullable=False, default=[])  # [{item, qty, rate} ...]
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    __table_args__ = (
+        UniqueConstraint("plan_id", "day", name="extras_plan_day_uniq"),
+    )
+
 Base.metadata.create_all(engine)
 
 # =========================
@@ -172,6 +184,15 @@ class ChecklistCellUpdate(BaseModel):
 class ChecklistUpdateIn(BaseModel):
     plan_id: str = DEFAULT_PLAN_ID
     updates: List[ChecklistCellUpdate]
+
+# ---- NEW: Items & Costs schemas ----
+class ExtraItem(BaseModel):
+    item: str
+    qty: float = 0
+    rate: float = 0
+
+class ExtrasUpsert(BaseModel):
+    items: List[ExtraItem] = []
 
 # =========================
 # Utilities
@@ -270,6 +291,7 @@ def _set_done_flag_value(raw, value: bool):
         else:
             for k in ("x","d","dd"):
                 if k in t:
+                    k_in = True
                     t[k] = False
     else:
         t["done"] = bool(value)
@@ -603,6 +625,23 @@ def upsert_grid(plan_id: str, payload: GridIn, db: Session = Depends(get_db)):
 
     db.commit()
     return {"ok": True}
+
+# ---- NEW: Items & Costs endpoints ----
+@app.get("/plans/{plan_id}/extras")
+def get_extras(plan_id: str, day: conint(ge=1) = Query(...), db: Session = Depends(get_db)):
+    row = db.query(Extras).filter_by(plan_id=plan_id, day=int(day)).one_or_none()
+    return row.items if row else []
+
+@app.put("/plans/{plan_id}/extras", dependencies=[Depends(require_write)])
+def put_extras(plan_id: str, payload: ExtrasUpsert, day: conint(ge=1) = Query(...), db: Session = Depends(get_db)):
+    row = db.query(Extras).filter_by(plan_id=plan_id, day=int(day)).one_or_none()
+    data = [it.dict() for it in (payload.items or [])]
+    if row:
+        row.items = data
+    else:
+        db.add(Extras(plan_id=plan_id, day=int(day), items=data))
+    db.commit()
+    return {"ok": True, "count": len(data)}
 
 # =========================
 # Ops: status + email + rollover
