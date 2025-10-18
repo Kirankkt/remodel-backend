@@ -15,10 +15,9 @@ from pydantic import BaseModel, conint
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, JSON, Boolean,
-    DateTime, Date, UniqueConstraint, ForeignKey, func, Numeric  # <-- added Numeric
+    DateTime, Date, UniqueConstraint, ForeignKey, func
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
-from sqlalchemy.exc import OperationalError, ProgrammingError  # for safe ALTERs
 
 # =========================
 # ENV / CONFIG
@@ -104,40 +103,19 @@ class RolloverLog(Base):
     moved = Column(JSON)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-# ---- Items & Costs persisted per plan+day (with total) ----
+# ---- Items & Costs persisted per plan+day ----
 class Extras(Base):
     __tablename__ = "extras"
     id = Column(Integer, primary_key=True)
     plan_id = Column(String, index=True, nullable=False)
     day = Column(Integer, nullable=False)
-    items = Column(JSON, nullable=False, default=[])  # [{item, qty, rate} ...]
-    total_amount = Column(Numeric(12,2), default=0)   # <-- NEW: cached total
+    items = Column(JSON, nullable=False, default=[])  # [{item, qty, rate, amount} ...]
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     __table_args__ = (
         UniqueConstraint("plan_id", "day", name="extras_plan_day_uniq"),
     )
 
 Base.metadata.create_all(engine)
-
-# best-effort ensure 'total_amount' exists if table was created earlier without it
-with engine.begin() as conn:
-    try:
-        if engine.dialect.name == "postgresql":
-            conn.execute("ALTER TABLE extras ADD COLUMN IF NOT EXISTS total_amount numeric(12,2) DEFAULT 0;")
-        elif engine.dialect.name == "sqlite":
-            # sqlite supports ADD COLUMN (no IF NOT EXISTS), so try/catch
-            try:
-                conn.execute("ALTER TABLE extras ADD COLUMN total_amount REAL DEFAULT 0;")
-            except (OperationalError, ProgrammingError):
-                pass
-        else:
-            # generic best effort (may no-op on some dialects)
-            try:
-                conn.execute("ALTER TABLE extras ADD COLUMN total_amount numeric(12,2) DEFAULT 0;")
-            except Exception:
-                pass
-    except Exception:
-        pass
 
 # =========================
 # FastAPI app
@@ -207,11 +185,12 @@ class ChecklistUpdateIn(BaseModel):
     plan_id: str = DEFAULT_PLAN_ID
     updates: List[ChecklistCellUpdate]
 
-# ---- Items & Costs schemas ----
+# Items & Costs schemas
 class ExtraItem(BaseModel):
     item: str
     qty: float = 0
     rate: float = 0
+    amount: Optional[float] = None  # computed server-side
 
 class ExtrasUpsert(BaseModel):
     items: List[ExtraItem] = []
@@ -242,6 +221,7 @@ def _is_off(d: date) -> bool:
     return d.weekday() == 6 or (d.month, d.day) in OFF_MD
 
 def _date_for_day(start: date, day: int) -> date:
+    """Map Day N -> calendar date, skipping off-days."""
     dt = start
     steps = max(0, day - 1)
     while steps > 0:
@@ -251,6 +231,7 @@ def _date_for_day(start: date, day: int) -> date:
     return dt
 
 def _workday_index(start: date, d: date) -> int:
+    """Map a calendar date to its workday index (Day N)."""
     if d <= start:
         return 1
     idx, cur = 1, start
@@ -311,7 +292,6 @@ def _set_done_flag_value(raw, value: bool):
         else:
             for k in ("x","d","dd"):
                 if k in t:
-                    k_in = True  # keep your original behavior
                     t[k] = False
     else:
         t["done"] = bool(value)
@@ -415,7 +395,7 @@ def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: 
     db.commit()
     return {"ok": True, "moved": 0}
 
-# NEW: update workers/hours from the checklist (token-protected)
+# update workers/hours from the checklist (token-protected)
 class ChecklistWH(BaseModel):
     area: str
     day: conint(ge=1)
@@ -646,40 +626,37 @@ def upsert_grid(plan_id: str, payload: GridIn, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True}
 
-# ---- Items & Costs endpoints (now return & persist total) ----
+# ---- Items & Costs endpoints ----
 @app.get("/plans/{plan_id}/extras")
 def get_extras(plan_id: str, day: conint(ge=1) = Query(...), db: Session = Depends(get_db)):
     row = db.query(Extras).filter_by(plan_id=plan_id, day=int(day)).one_or_none()
-    items = list(row.items or []) if row else []
-    # Use stored total if present, otherwise compute
-    if row and row.total_amount is not None:
-        try:
-            total = float(row.total_amount)
-        except Exception:
-            total = sum((float(i.get("qty") or 0) * float(i.get("rate") or 0)) for i in items)
-    else:
-        total = sum((float(i.get("qty") or 0) * float(i.get("rate") or 0)) for i in items)
-    return {"items": items, "total": round(total, 2)}
+    return row.items if row else []
 
 @app.put("/plans/{plan_id}/extras", dependencies=[Depends(require_write)])
 def put_extras(plan_id: str, payload: ExtrasUpsert, day: conint(ge=1) = Query(...), db: Session = Depends(get_db)):
-    # normalize and compute
-    norm = []
-    for it in (payload.items or []):
-        item = (it.item or "").strip()
-        qty  = float(it.qty or 0)
-        rate = float(it.rate or 0)
-        norm.append({"item": item, "qty": qty, "rate": rate})
-    total = sum((x["qty"] * x["rate"]) for x in norm)
-
     row = db.query(Extras).filter_by(plan_id=plan_id, day=int(day)).one_or_none()
+
+    # Normalize and compute amount per row on the server
+    data = []
+    for it in (payload.items or []):
+        q = float(it.qty or 0)
+        r = float(it.rate or 0)
+        amt = round(q * r, 2)
+        data.append({
+            "item": it.item,
+            "qty": q,
+            "rate": r,
+            "amount": amt,
+        })
+
     if row:
-        row.items = norm
-        row.total_amount = total
+        row.items = data
     else:
-        db.add(Extras(plan_id=plan_id, day=int(day), items=norm, total_amount=total))
+        db.add(Extras(plan_id=plan_id, day=int(day), items=data))
     db.commit()
-    return {"ok": True, "count": len(norm), "total": round(float(total), 2)}
+
+    total = round(sum(x.get("amount", 0) for x in data), 2)
+    return {"ok": True, "count": len(data), "total": total}
 
 # =========================
 # Ops: status + email + rollover
@@ -884,6 +861,7 @@ if HAVE_SCHEDULER:
             try:
                 with SessionLocal() as db:
                     start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
+                    # Roll yesterday -> today using previous workday index
                     today_idx = _workday_index(start_date, _today_local())
                     from_day  = max(1, today_idx - 1)
                     moved = _rollover_incomplete(db, DEFAULT_PLAN_ID, from_day)
