@@ -1,0 +1,24 @@
+name: Nightly rollover
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 18:30 UTC = 00:00 IST
+    - cron: '30 18 * * *'
+
+jobs:
+  rollover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      BASE: ${{ secrets.BACKEND_URL }}
+      API_KEY: ${{ secrets.BACKEND_API_KEY }}
+    steps:
+      - name: Call /ops/rollover (yesterday → today)
+        run: |
+          set -euxo pipefail
+          for i in 1 2 3; do
+            curl -sfS -X POST "$BASE/ops/rollover" \
+              -H "x-api-key: $API_KEY" && break || sleep 10
+          done
