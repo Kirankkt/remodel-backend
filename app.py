@@ -334,6 +334,23 @@ def _clear_done_and_progress(raw):
     """Reset done=False, progress=0."""
     s = _set_progress_value(raw, 0)
     return _set_done_flag_value(s, False)
+def _clear_done_keep_progress(raw):
+    """Unset 'done' but KEEP whatever progress was set."""
+    try:
+        t = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except Exception:
+        return raw
+    compact = any(k in t for k in ("n","r","w","h")) and ("name" not in t)
+    if compact:
+        # compact form: 'x' is the done flag; do NOT touch 'p'
+        for k in ("x","d","dd"):
+            if k in t:
+                t[k] = False
+    else:
+        t["done"] = False
+        # DO NOT change t["progress"]
+    return json.dumps(t, ensure_ascii=False)
+
 
 def _serialize_grid(db: Session, plan_id: str):
     rows = db.query(Cell).filter(Cell.plan_id == plan_id).all()
@@ -375,7 +392,7 @@ def _rollover_incomplete(db: Session, plan_id: str, from_day: int) -> int:
                 carry.append(s)
         row.activities = keep
         if carry:
-            carry = [_clear_done_and_progress(s) for s in carry]
+            carry = [_clear_done_keep_progress(s) for s in carry]
             _append_to_cell(db, plan_id, row.area, to_day, carry)
             moved += len(carry)
     db.commit()
@@ -397,9 +414,10 @@ def _rollover_incomplete_with_detail(db: Session, plan_id: str, from_day: int):
                 carry.append(s)
         row.activities = keep
         if carry:
-            cleared = [_clear_done_and_progress(s) for s in carry]
+            cleared = [_clear_done_keep_progress(s) for s in carry]
             _append_to_cell(db, plan_id, row.area, to_day, cleared)
-            detail.append({"area": row.area, "items": cleared})
+             detail.append({"area": row.area, "items": cleared})
+
             moved += len(carry)
     db.commit()
     return moved, detail
