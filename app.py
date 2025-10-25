@@ -275,14 +275,14 @@ def _normalize_task(obj_or_json):
     try:
         t = json.loads(obj_or_json) if isinstance(obj_or_json, str) else dict(obj_or_json or {})
     except Exception:
-        return {"name": str(obj_or_json), "role": "", "workers": 0, "hours": 0, "done": False, "progress": 0}
+        return {"name": str(obj_or_json), "role": "", "workers": 0, "hours": 0.0, "done": False, "progress": 0}
     name    = t.get("name") or t.get("task") or t.get("n") or ""
     role    = t.get("role") or t.get("r") or ""
     workers = t.get("workers", t.get("w", 0)) or 0
-    hours   = t.get("hours", t.get("h", 0)) or 0
-    progress = int(t.get("progress", t.get("p", 0)) or 0)
-    done    = bool(t.get("done") or t.get("d") or t.get("x") or t.get("dd") or (progress >= 100))
-    return {"name": name, "role": role, "workers": int(workers), "hours": int(hours), "done": done, "progress": max(0, min(100, progress))}
+    hours   = t.get("hours",   t.get("h", 0)) or 0
+    done    = bool(t.get("done") or t.get("d") or t.get("x") or t.get("dd"))
+    progress = max(0, min(100, int(t.get("progress", 0) or 0)))
+    return {"name": name, "role": role, "workers": int(workers), "hours": float(hours), "done": done, "progress": progress}
 
 def _set_done_flag_value(raw, value: bool):
     try:
@@ -441,7 +441,7 @@ class ChecklistWH(BaseModel):
     day: conint(ge=1)
     index: conint(ge=0)
     workers: Optional[int] = None
-    hours: Optional[int] = None
+    hours: Optional[float] = None
     progress: Optional[int] = None  # NEW
 
 class WHUpdateIn(BaseModel):
@@ -473,7 +473,7 @@ def checklist_update_fields(payload: WHUpdateIn, token: Optional[str] = None, db
         if it.workers is not None:
             t["workers"] = int(it.workers)
         if it.hours is not None:
-            t["hours"] = int(it.hours)
+            t["hours"] = float(it.hours)
         if it.progress is not None:
             p = max(0, min(100, int(it.progress)))
             t["progress"] = p
