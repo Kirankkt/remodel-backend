@@ -520,7 +520,12 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
 
     # CSV
     csv_buf = io.StringIO()
-    writer = csv.DictWriter(csv_buf, fieldnames=["date", "day", "area", "task", "role", "workers", "hours", "progress", "done"])
+    writer = csv.DictWriter(
+    csv_buf,
+    fieldnames=["date", "day", "area", "task", "role", "workers", "hours", "progress", "done"],
+    extrasaction="ignore",   # <-- add this
+)
+
     writer.writeheader()
     for r in rows:
         writer.writerow(r)
