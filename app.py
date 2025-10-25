@@ -4,9 +4,13 @@ import io
 import json
 import base64
 import smtplib
+import hmac
+import hashlib
+import time
 from typing import List, Optional
 from datetime import datetime, timedelta, date
 from email.message import EmailMessage
+from urllib.parse import urlencode, quote_plus
 
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Header, APIRouter, Query
@@ -53,6 +57,9 @@ DAILY_TO  = [e.strip() for e in _env("DAILY_TO", "").replace(";", ",").split(","
 RESEND_API_KEY = _env("RESEND_API_KEY")
 RESEND_FROM    = _env("RESEND_FROM", SMTP_FROM or (SMTP_USER or ""))
 RESEND_TO      = _env("RESEND_TO", ",".join(DAILY_TO))
+
+# Secret for signing email quick-action links (falls back to CHECK_TOKEN)
+EMAIL_ACTION_SECRET = _env("EMAIL_ACTION_SECRET", CHECK_TOKEN or "changeme")
 
 # =========================
 # DB setup
@@ -269,32 +276,49 @@ def _append_to_cell(db: Session, plan_id: str, area: str, day: int, items: List[
         db.add(Cell(plan_id=plan_id, area=area, day=day, activities=list(items)))
 
 def _normalize_task(obj_or_json):
+    """Normalize a task object/string to a dict with progress support."""
     try:
         t = json.loads(obj_or_json) if isinstance(obj_or_json, str) else dict(obj_or_json or {})
     except Exception:
-        return {"name": str(obj_or_json), "role": "", "workers": 0, "hours": 0, "done": False}
+        return {"name": str(obj_or_json), "role": "", "workers": 0, "hours": 0, "done": False, "progress": 0}
     name    = t.get("name") or t.get("task") or t.get("n") or ""
     role    = t.get("role") or t.get("r") or ""
     workers = t.get("workers", t.get("w", 0)) or 0
     hours   = t.get("hours", t.get("h", 0)) or 0
     done    = bool(t.get("done") or t.get("d") or t.get("x") or t.get("dd"))
-    return {"name": name, "role": role, "workers": int(workers), "hours": int(hours), "done": done}
+    prog    = t.get("progress", t.get("p", 0)) or 0
+    try:
+        prog = int(prog)
+    except Exception:
+        prog = 0
+    prog = max(0, min(100, prog))
+    return {"name": name, "role": role, "workers": int(workers), "hours": int(hours), "done": done, "progress": prog}
 
 def _set_done_flag_value(raw, value: bool):
+    """Flip done flag; if setting done=True, force progress to 100."""
     try:
         t = json.loads(raw) if isinstance(raw, str) else dict(raw)
     except Exception:
         return raw
-    compact = any(k in t for k in ("n","r","w","h")) and ("name" not in t)
+    compact = any(k in t for k in ("n","r","w","h","p")) and ("name" not in t)
     if compact:
         if value:
             t["x"] = True
+            try:
+                t["p"] = max(int(t.get("p") or 0), 100)
+            except Exception:
+                t["p"] = 100
         else:
             for k in ("x","d","dd"):
                 if k in t:
                     t[k] = False
     else:
         t["done"] = bool(value)
+        if value:
+            try:
+                t["progress"] = max(int(t.get("progress") or 0), 100)
+            except Exception:
+                t["progress"] = 100
     return json.dumps(t, ensure_ascii=False)
 
 def _serialize_grid(db: Session, plan_id: str):
@@ -318,6 +342,26 @@ def _canon(x):
         return json.dumps(x, sort_keys=True, ensure_ascii=False)
     except Exception:
         return str(x)
+
+# Signing for email quick actions
+def _sign_payload(data: dict) -> str:
+    payload = json.dumps(data, separators=(",", ":"), sort_keys=True)
+    return hmac.new((EMAIL_ACTION_SECRET or "changeme").encode("utf-8"),
+                    payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def _verify_signature(data: dict, sig: str) -> bool:
+    expected = _sign_payload(data)
+    return hmac.compare_digest(expected, str(sig or ""))
+
+def _email_progress_link(plan_id: str, area: str, day: int, index: int, value: int) -> str:
+    data = {
+        "plan_id": plan_id, "area": area, "day": int(day), "index": int(index),
+        "value": max(0, min(100, int(value))), "exp": int(time.time()) + 14*24*3600  # 14 days
+    }
+    sig = _sign_payload(data)
+    qs = urlencode({**data, "sig": sig}, quote_via=quote_plus)
+    base = BACKEND_PUBLIC_BASE.rstrip("/")
+    return f"{base}/ops/email_set_progress?{qs}"
 
 # =========================
 # Rollover (append-only)
@@ -395,13 +439,14 @@ def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: 
     db.commit()
     return {"ok": True, "moved": 0}
 
-# update workers/hours from the checklist (token-protected)
+# update workers/hours/progress from the checklist (token-protected)
 class ChecklistWH(BaseModel):
     area: str
     day: conint(ge=1)
     index: conint(ge=0)
     workers: Optional[int] = None
     hours: Optional[int] = None
+    progress: Optional[int] = None  # 0..100
 
 class WHUpdateIn(BaseModel):
     plan_id: str = DEFAULT_PLAN_ID
@@ -427,11 +472,18 @@ def checklist_update_fields(payload: WHUpdateIn, token: Optional[str] = None, db
         try:
             t = json.loads(acts[it.index]) if isinstance(acts[it.index], str) else dict(acts[it.index])
         except Exception:
-            t = {"name": str(acts[it.index]), "role": "", "workers": 0, "hours": 0, "done": False}
+            t = {"name": str(acts[it.index]), "role": "", "workers": 0, "hours": 0, "done": False, "progress": 0}
+
         if it.workers is not None:
             t["workers"] = int(it.workers)
         if it.hours is not None:
             t["hours"] = int(it.hours)
+        if it.progress is not None:
+            p = max(0, min(100, int(it.progress)))
+            t["progress"] = p
+            if p >= 100:
+                t["done"] = True  # reaching 100% marks as done
+
         acts[it.index] = json.dumps(t, ensure_ascii=False)
         row.activities = acts
         updated += 1
@@ -448,9 +500,10 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
 
     cells = _fetch_cells_range(db, plan_id, start_day, start_day + span - 1)
 
-    rows = []
+    rows = []  # include index for quick-update links
     for c in cells:
-        for s in (c["activities"] or []):
+        acts = c["activities"] or []
+        for idx, s in enumerate(acts):
             nt = _normalize_task(s)
             rows.append({
                 "date": _date_for_day(start_date, c["day"]).isoformat(),
@@ -460,16 +513,20 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
                 "role": nt["role"],
                 "workers": nt["workers"],
                 "hours": nt["hours"],
-                "done": "yes" if nt["done"] else ""
+                "progress": nt["progress"],
+                "done": "yes" if nt["done"] else "",
+                "index": idx,
             })
 
+    # CSV
     csv_buf = io.StringIO()
-    writer = csv.DictWriter(csv_buf, fieldnames=["date", "day", "area", "task", "role", "workers", "hours", "done"])
+    writer = csv.DictWriter(csv_buf, fieldnames=["date", "day", "area", "task", "role", "workers", "hours", "progress", "done"])
     writer.writeheader()
     for r in rows:
         writer.writerow(r)
     csv_bytes = csv_buf.getvalue().encode("utf-8")
 
+    # HTML
     by_day = {}
     for r in rows:
         by_day.setdefault(int(r["day"]), []).append(r)
@@ -477,21 +534,39 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
     def h(s):
         return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+    def progress_controls(r):
+        if not BACKEND_PUBLIC_BASE:
+            return f"{r['progress']}%"
+        # 0/25/50/75/100 as small inline links
+        opts = [0,25,50,75,100]
+        parts = []
+        for v in opts:
+            url = _email_progress_link(plan_id, r["area"], int(r["day"]), int(r["index"]), int(v))
+            parts.append(f"<a href='{h(url)}' style='margin-right:6px;text-decoration:none;border:1px solid #d1d5db;padding:3px 6px;border-radius:4px'>{v}%</a>")
+        return " ".join(parts)
+
     sections = []
     for d in range(start_day, start_day + span):
         the_date = _date_for_day(start_date, d).strftime("%d %b %Y")
         section = [
             f"<h3>Day {d} — {the_date}</h3>",
             "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:Arial;font-size:14px'>",
-            "<tr style='background:#f3f4f6'><th>Area</th><th>Task</th><th>Role</th><th>Workers</th><th>Hours</th></tr>"
+            "<tr style='background:#f3f4f6'><th>Area</th><th>Task</th><th>Role</th><th>Workers</th><th>Hours</th><th>Progress</th></tr>"
         ]
         for r in by_day.get(d, []):
+            left = max(0, 100 - int(r["progress"]))
             section.append(
-                f"<tr><td>{h(r['area'])}</td><td>{h(r['task'])}</td><td>{h(r['role'])}</td>"
-                f"<td>{r['workers']}</td><td>{r['hours']}</td></tr>"
+                f"<tr><td>{h(r['area'])}</td>"
+                f"<td>{h(r['task'])}{(' <span style=\"color:#059669\">(done)</span>' if r['done'] else '')}</td>"
+                f"<td>{h(r['role'])}</td>"
+                f"<td>{r['workers']}</td>"
+                f"<td>{r['hours']}</td>"
+                f"<td>{progress_controls(r)}"
+                f"{'' if r['done'] else f'<div style=\"color:#6b7280;margin-top:4px\">{left}% left</div>'}"
+                f"</td></tr>"
             )
         if not by_day.get(d):
-            section.append("<tr><td colspan='5' style='color:#6b7280'>No tasks</td></tr>")
+            section.append("<tr><td colspan='6' style='color:#6b7280'>No tasks</td></tr>")
         section.append("</table>")
         sections.append("\n".join(section))
 
@@ -507,6 +582,7 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
       <p>Good morning! Here is the {span}-day plan.</p>
       {('<p><a href="'+h(checklist_link)+'" style="display:inline-block;background:#2563eb;color:#fff;padding:10px 14px;border-radius:6px;text-decoration:none">Open live checklist</a></p>' if checklist_link else '')}
       {''.join(sections)}
+      <p style="color:#6b7280;font-size:12px;margin-top:10px">Tip: the progress buttons above are safe, signed links. Setting 100% marks the task as Done.</p>
     </div>
     """.strip()
 
@@ -824,6 +900,50 @@ def set_start_date(plan_id: str = DEFAULT_PLAN_ID, start: str = ""):
         p.start_date = d
         db.commit()
         return {"ok": True, "plan_id": plan_id, "start_date": str(d)}
+
+# ---- Email quick-action endpoint (GET) ----
+@ops.get("/email_set_progress")
+def email_set_progress(
+    plan_id: str, area: str, day: conint(ge=1), index: conint(ge=0),
+    value: conint(ge=0, le=100), exp: int, sig: str, db: Session = Depends(get_db)
+):
+    # verify signature & expiry
+    data = {"plan_id": plan_id, "area": area, "day": int(day), "index": int(index), "value": int(value), "exp": int(exp)}
+    if int(exp) < int(time.time()):
+        raise HTTPException(401, "Link expired")
+    if not _verify_signature(data, sig):
+        raise HTTPException(401, "Bad signature")
+
+    row = db.query(Cell).filter_by(plan_id=plan_id, area=area, day=int(day)).one_or_none()
+    if not row:
+        raise HTTPException(404, "Cell not found")
+
+    acts = list(row.activities or [])
+    if int(index) < 0 or int(index) >= len(acts):
+        raise HTTPException(404, "Task index not found")
+
+    try:
+        t = json.loads(acts[int(index)]) if isinstance(acts[int(index)], str) else dict(acts[int(index)])
+    except Exception:
+        t = {"name": str(acts[int(index)]), "role": "", "workers": 0, "hours": 0, "done": False, "progress": 0}
+
+    p = max(0, min(100, int(value)))
+    t["progress"] = p
+    if p >= 100:
+        t["done"] = True
+
+    acts[int(index)] = json.dumps(t, ensure_ascii=False)
+    row.activities = acts
+    db.commit()
+
+    # Tiny confirmation page
+    return (
+        "<!doctype html><meta charset='utf-8'>"
+        "<div style='font-family:Inter,system-ui,Arial;padding:24px'>"
+        "<h3 style='margin:0 0 8px'>Progress updated ✅</h3>"
+        "<p>You can close this window now.</p>"
+        "</div>"
+    )
 
 # ---- scheduler: 07:00 email & 00:00 rollover in configured TIMEZONE ----
 app.include_router(ops)
