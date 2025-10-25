@@ -416,8 +416,7 @@ def _rollover_incomplete_with_detail(db: Session, plan_id: str, from_day: int):
         if carry:
             cleared = [_clear_done_keep_progress(s) for s in carry]
             _append_to_cell(db, plan_id, row.area, to_day, cleared)
-             detail.append({"area": row.area, "items": cleared})
-
+            detail.append({"area": row.area, "items": cleared})
             moved += len(carry)
     db.commit()
     return moved, detail
