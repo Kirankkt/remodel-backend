@@ -816,7 +816,7 @@ def send_daily_email(plan_id: str = DEFAULT_PLAN_ID, span: int = 3):
             )
             return {"ok": True, "day": today_day}
     except Exception as e:
-        raise HTTPException(500, detail=str(e)))
+        raise HTTPException(500, detail=str(e))
 
 @ops.post("/rollover", dependencies=[Depends(require_key)])
 def rollover(plan_id: str = DEFAULT_PLAN_ID):
