@@ -281,7 +281,7 @@ def _normalize_task(obj_or_json):
     workers = t.get("workers", t.get("w", 0)) or 0
     hours   = t.get("hours",   t.get("h", 0)) or 0
     done    = bool(t.get("done") or t.get("d") or t.get("x") or t.get("dd"))
-    progress = max(0, min(100, int(t.get("progress", 0) or 0)))
+    progress = max(0, min(100, int(t.get("progress", t.get("p", 0)) or 0)))
     return {"name": name, "role": role, "workers": int(workers), "hours": float(hours), "done": done, "progress": progress}
 
 def _set_done_flag_value(raw, value: bool):
@@ -368,7 +368,8 @@ def _rollover_incomplete(db: Session, plan_id: str, from_day: int) -> int:
         acts = list(row.activities or [])
         keep, carry = [], []
         for s in acts:
-            if _normalize_task(s)["done"]:
+            nt = _normalize_task(s)
+            if nt["done"] or nt["progress"] >= 100:
                 keep.append(s)
             else:
                 carry.append(s)
@@ -389,7 +390,8 @@ def _rollover_incomplete_with_detail(db: Session, plan_id: str, from_day: int):
         acts = list(row.activities or [])
         keep, carry = [], []
         for s in acts:
-            if _normalize_task(s)["done"]:
+            nt = _normalize_task(s)
+            if nt["done"] or nt["progress"] >= 100:
                 keep.append(s)
             else:
                 carry.append(s)
@@ -442,7 +444,7 @@ class ChecklistWH(BaseModel):
     index: conint(ge=0)
     workers: Optional[int] = None
     hours: Optional[float] = None
-    progress: Optional[int] = None  # NEW
+    progress: Optional[int] = None  # slider value
 
 class WHUpdateIn(BaseModel):
     plan_id: str = DEFAULT_PLAN_ID
@@ -486,6 +488,40 @@ def checklist_update_fields(payload: WHUpdateIn, token: Optional[str] = None, db
     db.commit()
     return {"ok": True, "updated": updated}
 
+# --- dedicated progress endpoint used by live checklist ---
+class ChecklistProgressItem(BaseModel):
+    area: str
+    day: conint(ge=1)
+    index: conint(ge=0)
+    progress: conint(ge=0, le=100)
+
+class ProgressUpdateIn(BaseModel):
+    plan_id: str = DEFAULT_PLAN_ID
+    items: List[ChecklistProgressItem]
+
+@ops.post("/checklist_progress")
+def checklist_progress(payload: ProgressUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
+    if not CHECK_TOKEN or token != CHECK_TOKEN:
+        raise HTTPException(401, "Invalid token")
+
+    plan = db.get(Plan, payload.plan_id)
+    if not plan:
+        raise HTTPException(404, "Plan not found")
+
+    updated = 0
+    for it in payload.items or []:
+        row = db.query(Cell).filter_by(plan_id=payload.plan_id, area=it.area, day=int(it.day)).one_or_none()
+        if not row:
+            continue
+        acts = list(row.activities or [])
+        if 0 <= it.index < len(acts):
+            acts[it.index] = _set_progress_value(acts[it.index], int(it.progress))
+            row.activities = acts
+            updated += 1
+
+    db.commit()
+    return {"ok": True, "updated": updated}
+
 # =========================
 # Email builders + senders
 # =========================
@@ -495,8 +531,8 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
 
     cells = _fetch_cells_range(db, plan_id, start_day, start_day + span - 1)
 
-    rows = []   # CSV rows (NO 'index' here)
-    html_rows = []  # hold (day, area, task, role, w, h, progress, index) for HTML table
+    rows = []   # CSV rows
+    html_rows = []  # (day, area, task, role, w, h, progress, index)
 
     for c in cells:
         for idx, s in enumerate(c["activities"] or []):
@@ -780,7 +816,7 @@ def send_daily_email(plan_id: str = DEFAULT_PLAN_ID, span: int = 3):
             )
             return {"ok": True, "day": today_day}
     except Exception as e:
-        raise HTTPException(500, detail=str(e))
+        raise HTTPException(500, detail=str(e)))
 
 @ops.post("/rollover", dependencies=[Depends(require_key)])
 def rollover(plan_id: str = DEFAULT_PLAN_ID):
