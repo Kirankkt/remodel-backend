@@ -450,6 +450,18 @@ class WHUpdateIn(BaseModel):
     plan_id: str = DEFAULT_PLAN_ID
     items: List[ChecklistWH]
 
+# used by /ops/checklist_update_progress (UI calls this for the slider)
+class ProgressItem(BaseModel):
+    area: str
+    day: conint(ge=1)
+    index: conint(ge=0)
+    progress: conint(ge=0, le=100)
+
+class ProgressUpdateIn(BaseModel):
+    plan_id: str = DEFAULT_PLAN_ID
+    items: List[ProgressItem]
+
+
 @ops.post("/checklist_update_fields")
 def checklist_update_fields(payload: WHUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
     if not CHECK_TOKEN or token != CHECK_TOKEN:
@@ -487,6 +499,40 @@ def checklist_update_fields(payload: WHUpdateIn, token: Optional[str] = None, db
 
     db.commit()
     return {"ok": True, "updated": updated}
+@ops.post("/checklist_update_progress")
+def checklist_update_progress(
+    payload: ProgressUpdateIn,
+    token: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    # Same token check as other checklist endpoints
+    if not CHECK_TOKEN or token != CHECK_TOKEN:
+        raise HTTPException(401, "Invalid token")
+
+    plan = db.get(Plan, payload.plan_id)
+    if not plan:
+        raise HTTPException(404, "Plan not found")
+
+    updated = 0
+    for it in (payload.items or []):
+        row = db.query(Cell).filter_by(
+            plan_id=payload.plan_id, area=it.area, day=int(it.day)
+        ).one_or_none()
+        if not row:
+            continue
+
+        acts = list(row.activities or [])
+        if it.index < 0 or it.index >= len(acts):
+            continue
+
+        # Use the helper you already have to keep done/progress in sync
+        acts[it.index] = _set_progress_value(acts[it.index], int(it.progress))
+        row.activities = acts
+        updated += 1
+
+    db.commit()
+    return {"ok": True, "updated": updated}
+
 
 # --- dedicated progress endpoint used by live checklist ---
 class ChecklistProgressItem(BaseModel):
