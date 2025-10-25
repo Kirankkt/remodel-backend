@@ -4,9 +4,6 @@ import io
 import json
 import base64
 import smtplib
-import hmac
-import hashlib
-import time
 from typing import List, Optional
 from datetime import datetime, timedelta, date
 from email.message import EmailMessage
@@ -15,6 +12,7 @@ from urllib.parse import urlencode, quote_plus
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Header, APIRouter, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, conint
 
 from sqlalchemy import (
@@ -57,9 +55,6 @@ DAILY_TO  = [e.strip() for e in _env("DAILY_TO", "").replace(";", ",").split(","
 RESEND_API_KEY = _env("RESEND_API_KEY")
 RESEND_FROM    = _env("RESEND_FROM", SMTP_FROM or (SMTP_USER or ""))
 RESEND_TO      = _env("RESEND_TO", ",".join(DAILY_TO))
-
-# Secret for signing email quick-action links (falls back to CHECK_TOKEN)
-EMAIL_ACTION_SECRET = _env("EMAIL_ACTION_SECRET", CHECK_TOKEN or "changeme")
 
 # =========================
 # DB setup
@@ -275,8 +270,8 @@ def _append_to_cell(db: Session, plan_id: str, area: str, day: int, items: List[
     else:
         db.add(Cell(plan_id=plan_id, area=area, day=day, activities=list(items)))
 
+# ---- task normalization + flag/slider sync ----
 def _normalize_task(obj_or_json):
-    """Normalize a task object/string to a dict with progress support."""
     try:
         t = json.loads(obj_or_json) if isinstance(obj_or_json, str) else dict(obj_or_json or {})
     except Exception:
@@ -285,41 +280,60 @@ def _normalize_task(obj_or_json):
     role    = t.get("role") or t.get("r") or ""
     workers = t.get("workers", t.get("w", 0)) or 0
     hours   = t.get("hours", t.get("h", 0)) or 0
-    done    = bool(t.get("done") or t.get("d") or t.get("x") or t.get("dd"))
-    prog    = t.get("progress", t.get("p", 0)) or 0
-    try:
-        prog = int(prog)
-    except Exception:
-        prog = 0
-    prog = max(0, min(100, prog))
-    return {"name": name, "role": role, "workers": int(workers), "hours": int(hours), "done": done, "progress": prog}
+    progress = int(t.get("progress", t.get("p", 0)) or 0)
+    done    = bool(t.get("done") or t.get("d") or t.get("x") or t.get("dd") or (progress >= 100))
+    return {"name": name, "role": role, "workers": int(workers), "hours": int(hours), "done": done, "progress": max(0, min(100, progress))}
 
 def _set_done_flag_value(raw, value: bool):
-    """Flip done flag; if setting done=True, force progress to 100."""
     try:
         t = json.loads(raw) if isinstance(raw, str) else dict(raw)
     except Exception:
         return raw
-    compact = any(k in t for k in ("n","r","w","h","p")) and ("name" not in t)
+    compact = any(k in t for k in ("n","r","w","h")) and ("name" not in t)
     if compact:
         if value:
             t["x"] = True
-            try:
-                t["p"] = max(int(t.get("p") or 0), 100)
-            except Exception:
-                t["p"] = 100
+            t["p"] = 100
+        else:
+            for k in ("x","d","dd"):
+                if k in t:
+                    t[k] = False
+            if t.get("p", 0) >= 100:
+                t["p"] = 0
+    else:
+        t["done"] = bool(value)
+        if value:
+            t["progress"] = 100
+        else:
+            if int(t.get("progress", 0)) >= 100:
+                t["progress"] = 0
+    return json.dumps(t, ensure_ascii=False)
+
+def _set_progress_value(raw, value: int):
+    """Set progress (0..100) and keep done in sync."""
+    try:
+        t = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except Exception:
+        return raw
+    p = max(0, min(100, int(value)))
+    compact = any(k in t for k in ("n","r","w","h")) and ("name" not in t)
+    if compact:
+        t["p"] = p
+        if p >= 100:
+            t["x"] = True
         else:
             for k in ("x","d","dd"):
                 if k in t:
                     t[k] = False
     else:
-        t["done"] = bool(value)
-        if value:
-            try:
-                t["progress"] = max(int(t.get("progress") or 0), 100)
-            except Exception:
-                t["progress"] = 100
+        t["progress"] = p
+        t["done"] = bool(p >= 100)
     return json.dumps(t, ensure_ascii=False)
+
+def _clear_done_and_progress(raw):
+    """Reset done=False, progress=0."""
+    s = _set_progress_value(raw, 0)
+    return _set_done_flag_value(s, False)
 
 def _serialize_grid(db: Session, plan_id: str):
     rows = db.query(Cell).filter(Cell.plan_id == plan_id).all()
@@ -343,26 +357,6 @@ def _canon(x):
     except Exception:
         return str(x)
 
-# Signing for email quick actions
-def _sign_payload(data: dict) -> str:
-    payload = json.dumps(data, separators=(",", ":"), sort_keys=True)
-    return hmac.new((EMAIL_ACTION_SECRET or "changeme").encode("utf-8"),
-                    payload.encode("utf-8"), hashlib.sha256).hexdigest()
-
-def _verify_signature(data: dict, sig: str) -> bool:
-    expected = _sign_payload(data)
-    return hmac.compare_digest(expected, str(sig or ""))
-
-def _email_progress_link(plan_id: str, area: str, day: int, index: int, value: int) -> str:
-    data = {
-        "plan_id": plan_id, "area": area, "day": int(day), "index": int(index),
-        "value": max(0, min(100, int(value))), "exp": int(time.time()) + 14*24*3600  # 14 days
-    }
-    sig = _sign_payload(data)
-    qs = urlencode({**data, "sig": sig}, quote_via=quote_plus)
-    base = BACKEND_PUBLIC_BASE.rstrip("/")
-    return f"{base}/ops/email_set_progress?{qs}"
-
 # =========================
 # Rollover (append-only)
 # =========================
@@ -380,6 +374,7 @@ def _rollover_incomplete(db: Session, plan_id: str, from_day: int) -> int:
                 carry.append(s)
         row.activities = keep
         if carry:
+            carry = [_clear_done_and_progress(s) for s in carry]
             _append_to_cell(db, plan_id, row.area, to_day, carry)
             moved += len(carry)
     db.commit()
@@ -400,8 +395,9 @@ def _rollover_incomplete_with_detail(db: Session, plan_id: str, from_day: int):
                 carry.append(s)
         row.activities = keep
         if carry:
-            _append_to_cell(db, plan_id, row.area, to_day, carry)
-            detail.append({"area": row.area, "items": carry})
+            cleared = [_clear_done_and_progress(s) for s in carry]
+            _append_to_cell(db, plan_id, row.area, to_day, cleared)
+            detail.append({"area": row.area, "items": cleared})
             moved += len(carry)
     db.commit()
     return moved, detail
@@ -446,7 +442,7 @@ class ChecklistWH(BaseModel):
     index: conint(ge=0)
     workers: Optional[int] = None
     hours: Optional[int] = None
-    progress: Optional[int] = None  # 0..100
+    progress: Optional[int] = None  # NEW
 
 class WHUpdateIn(BaseModel):
     plan_id: str = DEFAULT_PLAN_ID
@@ -481,8 +477,7 @@ def checklist_update_fields(payload: WHUpdateIn, token: Optional[str] = None, db
         if it.progress is not None:
             p = max(0, min(100, int(it.progress)))
             t["progress"] = p
-            if p >= 100:
-                t["done"] = True  # reaching 100% marks as done
+            t["done"] = bool(p >= 100)
 
         acts[it.index] = json.dumps(t, ensure_ascii=False)
         row.activities = acts
@@ -500,10 +495,11 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
 
     cells = _fetch_cells_range(db, plan_id, start_day, start_day + span - 1)
 
-    rows = []  # include index for quick-update links
+    rows = []   # CSV rows (NO 'index' here)
+    html_rows = []  # hold (day, area, task, role, w, h, progress, index) for HTML table
+
     for c in cells:
-        acts = c["activities"] or []
-        for idx, s in enumerate(acts):
+        for idx, s in enumerate(c["activities"] or []):
             nt = _normalize_task(s)
             rows.append({
                 "date": _date_for_day(start_date, c["day"]).isoformat(),
@@ -514,18 +510,22 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
                 "workers": nt["workers"],
                 "hours": nt["hours"],
                 "progress": nt["progress"],
-                "done": "yes" if nt["done"] else "",
-                "index": idx,
+                "done": "yes" if nt["done"] else ""
+            })
+            html_rows.append({
+                "day": c["day"],
+                "area": c["area"],
+                "task": nt["name"],
+                "role": nt["role"],
+                "workers": nt["workers"],
+                "hours": nt["hours"],
+                "progress": nt["progress"],
+                "index": idx
             })
 
     # CSV
     csv_buf = io.StringIO()
-    writer = csv.DictWriter(
-    csv_buf,
-    fieldnames=["date", "day", "area", "task", "role", "workers", "hours", "progress", "done"],
-    extrasaction="ignore",   # <-- add this
-)
-
+    writer = csv.DictWriter(csv_buf, fieldnames=["date", "day", "area", "task", "role", "workers", "hours", "progress", "done"])
     writer.writeheader()
     for r in rows:
         writer.writerow(r)
@@ -533,42 +533,44 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
 
     # HTML
     by_day = {}
-    for r in rows:
+    for r in html_rows:
         by_day.setdefault(int(r["day"]), []).append(r)
 
     def h(s):
-        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return (str(s) if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    def progress_controls(r):
+    def quick_link(day, area, index, pct, label):
         if not BACKEND_PUBLIC_BASE:
-            return f"{r['progress']}%"
-        # 0/25/50/75/100 as small inline links
-        opts = [0,25,50,75,100]
-        parts = []
-        for v in opts:
-            url = _email_progress_link(plan_id, r["area"], int(r["day"]), int(r["index"]), int(v))
-            parts.append(f"<a href='{h(url)}' style='margin-right:6px;text-decoration:none;border:1px solid #d1d5db;padding:3px 6px;border-radius:4px'>{v}%</a>")
-        return " ".join(parts)
+            return f"<span class='muted'>{label}</span>"
+        q = {
+            "plan_id": plan_id, "day": day, "area": area,
+            "index": index, "progress": pct, "token": CHECK_TOKEN
+        }
+        return f"<a href='{BACKEND_PUBLIC_BASE}/ops/progress_link?{urlencode(q, quote_via=quote_plus)}' " \
+               f"style='display:inline-block;margin:2px 6px;padding:6px 10px;border:1px solid #d1d5db;border-radius:8px;text-decoration:none'>{h(label)}</a>"
 
     sections = []
     for d in range(start_day, start_day + span):
         the_date = _date_for_day(start_date, d).strftime("%d %b %Y")
         section = [
             f"<h3>Day {d} — {the_date}</h3>",
-            "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:Arial;font-size:14px'>",
-            "<tr style='background:#f3f4f6'><th>Area</th><th>Task</th><th>Role</th><th>Workers</th><th>Hours</th><th>Progress</th></tr>"
+            "<table border='0' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:Arial;font-size:14px;width:100%'>",
+            "<tr style='background:#f3f4f6'><th align='left'>Area</th><th align='left'>Task</th><th align='left'>Role</th>"
+            "<th align='left'>Workers</th><th align='left'>Hours</th><th align='left'>Progress</th></tr>"
         ]
         for r in by_day.get(d, []):
-            left = max(0, 100 - int(r["progress"]))
+            btns = " ".join([
+                quick_link(d, r["area"], r["index"], 0, "0%"),
+                quick_link(d, r["area"], r["index"], 25, "25%"),
+                quick_link(d, r["area"], r["index"], 50, "50%"),
+                quick_link(d, r["area"], r["index"], 75, "75%"),
+                quick_link(d, r["area"], r["index"], 100, "100%"),
+            ])
+            left = f"{max(0, 100 - int(r['progress']))}% left"
             section.append(
-                f"<tr><td>{h(r['area'])}</td>"
-                f"<td>{h(r['task'])}{(' <span style=\"color:#059669\">(done)</span>' if r['done'] else '')}</td>"
-                f"<td>{h(r['role'])}</td>"
-                f"<td>{r['workers']}</td>"
-                f"<td>{r['hours']}</td>"
-                f"<td>{progress_controls(r)}"
-                f"{'' if r['done'] else f'<div style=\"color:#6b7280;margin-top:4px\">{left}% left</div>'}"
-                f"</td></tr>"
+                f"<tr><td>{h(r['area'])}</td><td>{h(r['task'])}</td><td>{h(r['role'])}</td>"
+                f"<td>{r['workers']}</td><td>{r['hours']}</td>"
+                f"<td>{btns}<div class='muted' style='margin-top:4px'>{left}</div></td></tr>"
             )
         if not by_day.get(d):
             section.append("<tr><td colspan='6' style='color:#6b7280'>No tasks</td></tr>")
@@ -587,7 +589,6 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
       <p>Good morning! Here is the {span}-day plan.</p>
       {('<p><a href="'+h(checklist_link)+'" style="display:inline-block;background:#2563eb;color:#fff;padding:10px 14px;border-radius:6px;text-decoration:none">Open live checklist</a></p>' if checklist_link else '')}
       {''.join(sections)}
-      <p style="color:#6b7280;font-size:12px;margin-top:10px">Tip: the progress buttons above are safe, signed links. Setting 100% marks the task as Done.</p>
     </div>
     """.strip()
 
@@ -792,6 +793,34 @@ def rollover(plan_id: str = DEFAULT_PLAN_ID):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
+# Quick progress update via email link (GET)
+@ops.get("/progress_link", response_class=HTMLResponse)
+def progress_link(
+    plan_id: str,
+    area: str,
+    day: conint(ge=1),
+    index: conint(ge=0),
+    progress: conint(ge=0, le=100),
+    token: str,
+    db: Session = Depends(get_db)
+):
+    if not CHECK_TOKEN or token != CHECK_TOKEN:
+        raise HTTPException(401, "Invalid token")
+    row = db.query(Cell).filter_by(plan_id=plan_id, area=area, day=int(day)).one_or_none()
+    if not row:
+        raise HTTPException(404, "Cell not found")
+    acts = list(row.activities or [])
+    if index < 0 or index >= len(acts):
+        raise HTTPException(400, "Bad index")
+    acts[index] = _set_progress_value(acts[index], int(progress))
+    row.activities = acts
+    db.commit()
+    msg = f"Updated: {area}, Day {day}, item #{index} → {progress}%"
+    link = ""
+    if FRONTEND_PUBLIC_BASE and BACKEND_PUBLIC_BASE:
+        link = f"<p><a href='{FRONTEND_PUBLIC_BASE}/checklist.html?plan={plan_id}&startDay={day}&days=3&t={CHECK_TOKEN}&api={BACKEND_PUBLIC_BASE}'>Open live checklist</a></p>"
+    return f"<div style='font-family:Arial;padding:16px'><p>{msg}</p>{link}<p>You can close this tab.</p></div>"
+
 # =========================
 # Snapshot/reset/undo endpoints
 # =========================
@@ -817,7 +846,7 @@ def snapshot_reset(plan_id: str = DEFAULT_PLAN_ID, reset_done: bool = True):
         cells = snap.grid or []
         if reset_done:
             def _clear_flags(acts):
-                return [_set_done_flag_value(s, False) for s in (acts or [])]
+                return [_clear_done_and_progress(s) for s in (acts or [])]
             cells = [{"area": c["area"], "day": c["day"], "activities": _clear_flags(c.get("activities"))} for c in cells]
         _overwrite_grid(db, plan_id, cells)
         db.query(RolloverLog).filter(RolloverLog.plan_id == plan_id).delete()
@@ -829,7 +858,7 @@ def checklist_reset_all(plan_id: str = DEFAULT_PLAN_ID):
     with SessionLocal() as db:
         rows = db.query(Cell).filter_by(plan_id=plan_id).all()
         for row in rows:
-            row.activities = [_set_done_flag_value(s, False) for s in (row.activities or [])]
+            row.activities = [_clear_done_and_progress(s) for s in (row.activities or [])]
         db.commit()
     return {"ok": True, "plan_id": plan_id}
 
@@ -905,50 +934,6 @@ def set_start_date(plan_id: str = DEFAULT_PLAN_ID, start: str = ""):
         p.start_date = d
         db.commit()
         return {"ok": True, "plan_id": plan_id, "start_date": str(d)}
-
-# ---- Email quick-action endpoint (GET) ----
-@ops.get("/email_set_progress")
-def email_set_progress(
-    plan_id: str, area: str, day: conint(ge=1), index: conint(ge=0),
-    value: conint(ge=0, le=100), exp: int, sig: str, db: Session = Depends(get_db)
-):
-    # verify signature & expiry
-    data = {"plan_id": plan_id, "area": area, "day": int(day), "index": int(index), "value": int(value), "exp": int(exp)}
-    if int(exp) < int(time.time()):
-        raise HTTPException(401, "Link expired")
-    if not _verify_signature(data, sig):
-        raise HTTPException(401, "Bad signature")
-
-    row = db.query(Cell).filter_by(plan_id=plan_id, area=area, day=int(day)).one_or_none()
-    if not row:
-        raise HTTPException(404, "Cell not found")
-
-    acts = list(row.activities or [])
-    if int(index) < 0 or int(index) >= len(acts):
-        raise HTTPException(404, "Task index not found")
-
-    try:
-        t = json.loads(acts[int(index)]) if isinstance(acts[int(index)], str) else dict(acts[int(index)])
-    except Exception:
-        t = {"name": str(acts[int(index)]), "role": "", "workers": 0, "hours": 0, "done": False, "progress": 0}
-
-    p = max(0, min(100, int(value)))
-    t["progress"] = p
-    if p >= 100:
-        t["done"] = True
-
-    acts[int(index)] = json.dumps(t, ensure_ascii=False)
-    row.activities = acts
-    db.commit()
-
-    # Tiny confirmation page
-    return (
-        "<!doctype html><meta charset='utf-8'>"
-        "<div style='font-family:Inter,system-ui,Arial;padding:24px'>"
-        "<h3 style='margin:0 0 8px'>Progress updated ✅</h3>"
-        "<p>You can close this window now.</p>"
-        "</div>"
-    )
 
 # ---- scheduler: 07:00 email & 00:00 rollover in configured TIMEZONE ----
 app.include_router(ops)
