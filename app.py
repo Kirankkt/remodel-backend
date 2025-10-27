@@ -334,6 +334,7 @@ def _clear_done_and_progress(raw):
     """Reset done=False, progress=0."""
     s = _set_progress_value(raw, 0)
     return _set_done_flag_value(s, False)
+
 def _clear_done_keep_progress(raw):
     """Unset 'done' but KEEP whatever progress was set."""
     try:
@@ -350,7 +351,6 @@ def _clear_done_keep_progress(raw):
         t["done"] = False
         # DO NOT change t["progress"]
     return json.dumps(t, ensure_ascii=False)
-
 
 def _serialize_grid(db: Session, plan_id: str):
     rows = db.query(Cell).filter(Cell.plan_id == plan_id).all()
@@ -424,6 +424,40 @@ def _rollover_incomplete_with_detail(db: Session, plan_id: str, from_day: int):
 # =========================
 # Checklist write endpoints
 # =========================
+class ChecklistWH(BaseModel):
+    area: str
+    day: conint(ge=1)
+    index: conint(ge=0)
+    workers: Optional[int] = None
+    hours: Optional[float] = None
+    progress: Optional[int] = None  # slider value
+
+class WHUpdateIn(BaseModel):
+    plan_id: str = DEFAULT_PLAN_ID
+    items: List[ChecklistWH]
+
+# used by /ops/checklist_update_progress (UI calls this for the slider)
+class ProgressItem(BaseModel):
+    area: str
+    day: conint(ge=1)
+    index: conint(ge=0)
+    progress: conint(ge=0, le=100)
+
+class ProgressUpdateIn(BaseModel):
+    plan_id: str = DEFAULT_PLAN_ID
+    items: List[ProgressItem]
+
+# live-checklist progress (distinct schema name to avoid confusion)
+class ChecklistProgressItem(BaseModel):
+    area: str
+    day: conint(ge=1)
+    index: conint(ge=0)
+    progress: conint(ge=0, le=100)
+
+class ChecklistProgressUpdateIn(BaseModel):
+    plan_id: str = DEFAULT_PLAN_ID
+    items: List[ChecklistProgressItem]
+
 @ops.post("/checklist_mark")
 def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
     if not CHECK_TOKEN or token != CHECK_TOKEN:
@@ -453,31 +487,6 @@ def checklist_mark(payload: ChecklistUpdateIn, token: Optional[str] = None, db: 
 
     db.commit()
     return {"ok": True, "moved": 0}
-
-# update workers/hours/progress from the checklist (token-protected)
-class ChecklistWH(BaseModel):
-    area: str
-    day: conint(ge=1)
-    index: conint(ge=0)
-    workers: Optional[int] = None
-    hours: Optional[float] = None
-    progress: Optional[int] = None  # slider value
-
-class WHUpdateIn(BaseModel):
-    plan_id: str = DEFAULT_PLAN_ID
-    items: List[ChecklistWH]
-
-# used by /ops/checklist_update_progress (UI calls this for the slider)
-class ProgressItem(BaseModel):
-    area: str
-    day: conint(ge=1)
-    index: conint(ge=0)
-    progress: conint(ge=0, le=100)
-
-class ProgressUpdateIn(BaseModel):
-    plan_id: str = DEFAULT_PLAN_ID
-    items: List[ProgressItem]
-
 
 @ops.post("/checklist_update_fields")
 def checklist_update_fields(payload: WHUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
@@ -516,13 +525,13 @@ def checklist_update_fields(payload: WHUpdateIn, token: Optional[str] = None, db
 
     db.commit()
     return {"ok": True, "updated": updated}
+
 @ops.post("/checklist_update_progress")
 def checklist_update_progress(
     payload: ProgressUpdateIn,
     token: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    # Same token check as other checklist endpoints
     if not CHECK_TOKEN or token != CHECK_TOKEN:
         raise HTTPException(401, "Invalid token")
 
@@ -542,7 +551,6 @@ def checklist_update_progress(
         if it.index < 0 or it.index >= len(acts):
             continue
 
-        # Use the helper you already have to keep done/progress in sync
         acts[it.index] = _set_progress_value(acts[it.index], int(it.progress))
         row.activities = acts
         updated += 1
@@ -550,22 +558,8 @@ def checklist_update_progress(
     db.commit()
     return {"ok": True, "updated": updated}
 
-
-# --- dedicated progress endpoint used by live checklist ---
-class ChecklistProgressItem(BaseModel):
-    area: str
-    day: conint(ge=1)
-    index: conint(ge=0)
-    progress: conint(ge=0, le=100)
-
-class ChecklistProgressUpdateIn(BaseModel):
-    plan_id: str = DEFAULT_PLAN_ID
-    items: List[ChecklistProgressItem]
-
-
 @ops.post("/checklist_progress")
 def checklist_progress(payload: ChecklistProgressUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
-
     if not CHECK_TOKEN or token != CHECK_TOKEN:
         raise HTTPException(401, "Invalid token")
 
@@ -692,6 +686,187 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
       {''.join(sections)}
     </div>
     """.strip()
+
+    return html, csv_bytes
+
+# ---- Summary helpers (per-area cumulative, per-trade, carry-overs) ----
+def _pct(x, y):
+    return 0 if y == 0 else round(100.0 * x / y, 1)
+
+def _h(s):
+    return (str(s) if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def _role_bucket(role: str) -> str:
+    """
+    Normalize free-text roles into trades so spelling differences don't fragment the report.
+    """
+    r = (role or "").strip().lower()
+    if "demo" in r: return "Demolition"
+    if "civil" in r or "masonry" in r or "brick" in r or "concrete" in r: return "Civil Work"
+    if "electric" in r: return "Electrical"
+    if "plumb" in r or "sanitary" in r: return "Plumbing"
+    if "carpent" in r or "wood" in r: return "Carpentry"
+    if "tile" in r: return "Tiling"
+    if "paint" in r or "putty" in r: return "Painting"
+    if "waterproof" in r: return "Waterproofing"
+    if "floor" in r and "tile" not in r: return "Flooring"
+    if "false ceiling" in r or "gypsum" in r or "pop" in r: return "False Ceiling"
+    return "Other"
+
+def _build_cumulative_kpis(db: Session, plan_id: str, upto_day: int):
+    """Aggregate Day 1..upto_day (inclusive) into area/trade totals and pending detail."""
+    cells = _fetch_cells_range(db, plan_id, 1, max(1, int(upto_day)))
+    area_stats = {}   # {area: {done, partial, pending, total}}
+    trade_stats = {}  # {trade: {done, partial, pending, total}}
+    pending_detail = {}  # {area: [ (name, role, progress) ... ] }
+    totals = {"done":0, "partial":0, "pending":0, "total":0}
+
+    for c in cells:
+        for s in (c["activities"] or []):
+            t = _normalize_task(s)
+            prog = int(t["progress"] or 0)
+            done = bool(t["done"] or prog >= 100)
+            trade = _role_bucket(t["role"])
+
+            area_stats.setdefault(c["area"], {"done":0,"partial":0,"pending":0,"total":0})
+            trade_stats.setdefault(trade,    {"done":0,"partial":0,"pending":0,"total":0})
+
+            area_stats[c["area"]]["total"] += 1
+            trade_stats[trade]["total"]     += 1
+            totals["total"] += 1
+
+            if done:
+                area_stats[c["area"]]["done"] += 1
+                trade_stats[trade]["done"]    += 1
+                totals["done"] += 1
+            elif prog > 0:
+                area_stats[c["area"]]["partial"] += 1
+                trade_stats[trade]["partial"]    += 1
+                totals["partial"] += 1
+                pending_detail.setdefault(c["area"], []).append((t["name"], t["role"], prog))
+            else:
+                area_stats[c["area"]]["pending"] += 1
+                trade_stats[trade]["pending"]    += 1
+                totals["pending"] += 1
+                pending_detail.setdefault(c["area"], []).append((t["name"], t["role"], 0))
+
+    return area_stats, trade_stats, pending_detail, totals
+
+def _render_table(headers, rows):
+    th = "".join(f"<th align='left'>{_h(h)}</th>" for h in headers)
+    trs = []
+    for r in rows:
+        tds = "".join(f"<td>{_h(x)}</td>" for x in r)
+        trs.append(f"<tr>{tds}</tr>")
+    if not rows:
+        trs.append("<tr><td colspan='99' style='color:#6b7280'>No data</td></tr>")
+    return (
+        "<table border='1' cellpadding='6' cellspacing='0' "
+        "style='border-collapse:collapse;font-family:Arial;font-size:14px;width:100%'>"
+        f"<tr style='background:#f3f4f6'>{th}</tr>{''.join(trs)}</table>"
+    )
+
+def _render_carryovers_for_day(db: Session, plan_id: str, from_day: int):
+    """Read rollover_log for from_day → from_day+1 and render a bullet list."""
+    log = (
+        db.query(RolloverLog)
+          .filter(RolloverLog.plan_id == plan_id,
+                  RolloverLog.from_day == int(from_day),
+                  RolloverLog.to_day == int(from_day) + 1)
+          .order_by(RolloverLog.id.desc())
+          .first()
+    )
+    if not log or not (log.moved or []):
+        return "<p style='color:#6b7280'>No carry-overs from yesterday.</p>"
+
+    lis = []
+    for entry in (log.moved or []):
+        area = entry.get("area") or ""
+        items = entry.get("items") or []
+        names = []
+        for raw in items:
+            t = _normalize_task(raw)
+            names.append(f"{_h(t['name'])} ({_h(t['role'])} · {int(t['progress'])}%)")
+        lis.append(f"<li><b>{_h(area)}</b>: " + (", ".join(names) if names else "—") + "</li>")
+    return "<ul>" + "".join(lis) + "</ul>"
+
+def _build_morning_summary_email(db: Session, plan_id: str, today_day: int, lookahead_span: int = 3):
+    """
+    Compose the 07:00 email:
+      - cumulative up to yesterday (per-area + per-trade + pending)
+      - carry-overs from yesterday
+      - checklist for today..today+span-1
+    """
+    start_date = _get_start_date_for_plan(db, plan_id)
+    yday = max(1, today_day - 1)
+    ydate_str = _date_for_day(start_date, yday).strftime("%d %b %Y")
+
+    area_stats, trade_stats, pending_detail, totals = _build_cumulative_kpis(db, plan_id, yday)
+
+    # Executive overview
+    exec_html = (
+        f"<p><b>To date (up to Day {yday} / {ydate_str})</b>: "
+        f"{totals['done']}/{totals['total']} done "
+        f"({_pct(totals['done'], totals['total'])}%), "
+        f"in progress {totals['partial']}, pending {totals['pending']}.</p>"
+    )
+
+    # Per-area cumulative table
+    area_rows = []
+    for area in sorted(area_stats):
+        s = area_stats[area]
+        area_rows.append([
+            area,
+            f"{s['done']}/{s['total']} ({_pct(s['done'], s['total'])}%)",
+            f"{s['partial']} ({_pct(s['partial'], s['total'])}%)",
+            f"{s['pending']} ({_pct(s['pending'], s['total'])}%)",
+        ])
+    area_table = _render_table(["Area","Done","In progress","Pending"], area_rows)
+
+    # Per-trade cumulative table
+    trade_rows = []
+    for trade in sorted(trade_stats):
+        s = trade_stats[trade]
+        trade_rows.append([
+            trade,
+            f"{s['done']}/{s['total']} ({_pct(s['done'], s['total'])}%)",
+            f"{s['partial']} ({_pct(s['partial'], s['total'])}%)",
+            f"{s['pending']} ({_pct(s['pending'], s['total'])}%)",
+        ])
+    trade_table = _render_table(["Trade/Discipline","Done","In progress","Pending"], trade_rows)
+
+    # Pending: top 5 items per area
+    pend_sections = []
+    for area in sorted(pending_detail):
+        items = pending_detail[area][:5]
+        if not items:
+            continue
+        lis = "".join([f"<li>{_h(n)} <span style='color:#6b7280'>({_h(r)} · {int(p)}%)</span></li>" for (n,r,p) in items])
+        pend_sections.append(f"<h4 style='margin:8px 0 4px'>{_h(area)}</h4><ul>{lis}</ul>")
+    pending_html = "".join(pend_sections) or "<p style='color:#6b7280'>No pending items.</p>"
+
+    # Carry-overs from last night
+    carry_html = _render_carryovers_for_day(db, plan_id, yday)
+
+    # Today + lookahead checklist
+    checklist_html, csv_bytes = _build_three_day_report(db, plan_id, today_day, span=lookahead_span)
+
+    html = f'''
+      <div style="font-family:Arial,Helvetica,sans-serif">
+        <h2 style="margin:0 0 12px 0">Daily Summary (07:00) — Day {today_day}</h2>
+        {exec_html}
+        <h3 style="margin:16px 0 8px">Per-Area Cumulative Progress</h3>
+        {area_table}
+        <h3 style="margin:16px 0 8px">Trade/Discipline Progress</h3>
+        {trade_table}
+        <h3 style="margin:16px 0 8px">Key Pending Items by Area</h3>
+        {pending_html}
+        <h3 style="margin:16px 0 8px">Carry-overs from Yesterday (Day {yday} → {yday+1})</h3>
+        {carry_html}
+        <hr style="margin:18px 0;border:none;border-top:1px solid #e5e7eb" />
+        {checklist_html}
+      </div>
+    '''.strip()
 
     return html, csv_bytes
 
@@ -883,6 +1058,22 @@ def send_daily_email(plan_id: str = DEFAULT_PLAN_ID, span: int = 3):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
+# NEW: morning digest (summary + checklist) — use this for "Email now"
+@ops.get("/send_morning_digest", dependencies=[Depends(require_key)])
+def send_morning_digest(plan_id: str = DEFAULT_PLAN_ID, span: int = 3):
+    try:
+        with SessionLocal() as db:
+            start_date = _get_start_date_for_plan(db, plan_id)
+            today_day = max(1, _workday_index(start_date, _today_local()))
+            html, csv_bytes = _build_morning_summary_email(db, plan_id, today_day, lookahead_span=span)
+            _send_email(
+                subject=f"[{plan_id}] Daily Summary (Day {today_day}) + {span}-day checklist (Day {today_day}–{today_day+span-1})",
+                html=html, csv_bytes=csv_bytes, csv_name=f"checklist_day{today_day}.csv",
+            )
+            return {"ok": True, "day": today_day}
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
 @ops.post("/rollover", dependencies=[Depends(require_key)])
 def rollover(plan_id: str = DEFAULT_PLAN_ID):
     try:
@@ -1060,9 +1251,9 @@ if HAVE_SCHEDULER:
                 with SessionLocal() as db:
                     start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
                     today_day = max(1, _workday_index(start_date, _today_local()))
-                    html, csv_bytes = _build_three_day_report(db, DEFAULT_PLAN_ID, today_day, span=3)
+                    html, csv_bytes = _build_morning_summary_email(db, DEFAULT_PLAN_ID, today_day, lookahead_span=3)
                     _send_email(
-                        subject=f"[{DEFAULT_PLAN_ID}] 3-day checklist (Day {today_day}–{today_day+2})",
+                        subject=f"[{DEFAULT_PLAN_ID}] Daily Summary (Day {today_day}) + 3-day checklist (Day {today_day}–{today_day+2})",
                         html=html, csv_bytes=csv_bytes, csv_name=f"checklist_day{today_day}.csv"
                     )
             except Exception as e:
@@ -1072,21 +1263,25 @@ if HAVE_SCHEDULER:
             try:
                 with SessionLocal() as db:
                     start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
-        
+
                     today = _today_local()
                     yday = today - timedelta(days=1)
-        
+
                     # Only roll if YESTERDAY was a workday. (Prevents double-roll on Mon after Sun.)
                     if _is_off(yday):
                         print(f"Rollover: yesterday {yday} was OFF – skipping.")
                         return
-        
+
                     from_day = _workday_index(start_date, yday)  # roll 'yesterday' -> next workday
-                    moved = _rollover_incomplete(db, DEFAULT_PLAN_ID, from_day)
-                    print(f"Rollover moved {moved} item(s) from Day {from_day} → {from_day + 1}.")
+                    moved, detail = _rollover_incomplete_with_detail(db, DEFAULT_PLAN_ID, from_day)
+
+                    # Log carry-overs so the 07:00 email can list them
+                    log = RolloverLog(plan_id=DEFAULT_PLAN_ID, from_day=from_day, to_day=from_day+1, moved=detail)
+                    db.add(log); db.commit()
+
+                    print(f"Rollover (logged) moved {moved} item(s) from Day {from_day} → {from_day + 1}.")
             except Exception as e:
                 print("Evening rollover failed:", e)
-
 
         scheduler.add_job(job_email,    CronTrigger(hour=7,  minute=0, timezone=TZ))
         scheduler.add_job(job_rollover, CronTrigger(hour=0,  minute=0, timezone=TZ))
