@@ -239,6 +239,29 @@ def _workday_index(start: date, d: date) -> int:
             idx += 1
     return idx
 
+# --- NEW: robust "what day is today?" using RolloverLog ---
+def _current_plan_day(db: Session, plan_id: str) -> int:
+    """
+    Prefer the most recent rollover's to_day; fallback to start_date→workday index.
+    """
+    last = (
+        db.query(RolloverLog)
+          .filter(RolloverLog.plan_id == plan_id)
+          .order_by(RolloverLog.id.desc())
+          .first()
+    )
+    if last and isinstance(last.to_day, int):
+        try:
+            # If the log is very old (>3 days), ignore and fall back.
+            if last.created_at and (datetime.utcnow() - last.created_at.replace(tzinfo=None)) > timedelta(days=3):
+                pass
+            else:
+                return max(1, int(last.to_day))
+        except Exception:
+            return max(1, int(last.to_day))
+    start_date = _get_start_date_for_plan(db, plan_id)
+    return max(1, _workday_index(start_date, _today_local()))
+
 def _fetch_cells_range(db: Session, plan_id: str, from_day: int, to_day: int):
     rows = (
         db.query(Cell.area, Cell.day, Cell.activities)
@@ -558,8 +581,35 @@ def checklist_progress(payload: ChecklistProgressUpdateIn, token: Optional[str] 
     return {"ok": True, "updated": updated}
 
 # =========================
-# Email builders + senders
+# Email builders + senders (with visuals)
 # =========================
+
+# small helpers for visual bars (inline styles for email clients)
+def _stacked_bar(done: int, inprog: int, pending: int) -> str:
+    total = max(1, int(done + inprog + pending))
+    pd = int(round(100 * done / total))
+    pi = int(round(100 * inprog / total))
+    pp = max(0, 100 - pd - pi)
+    # colors: green (#10b981), amber (#f59e0b), gray (#e5e7eb)
+    return (
+        "<div style='width:160px;height:10px;background:#e5e7eb;border-radius:6px;overflow:hidden'>"
+        f"<div style='height:10px;width:{pd}%;background:#10b981;float:left'></div>"
+        f"<div style='height:10px;width:{pi}%;background:#f59e0b;float:left'></div>"
+        f"<div style='height:10px;width:{pp}%;background:#cfd4dc;float:left'></div>"
+        "</div>"
+    )
+
+def _single_bar(done: int, total: int) -> str:
+    pct = int(round(100 * (done / total))) if total else 0
+    return (
+        "<div style='width:360px;height:12px;background:#e5e7eb;border-radius:8px;overflow:hidden'>"
+        f"<div style='height:12px;width:{pct}%;background:#2563eb'></div>"
+        "</div>"
+        f"<div style='font-size:12px;color:#374151;margin-top:4px'>{pct}% complete (Done {done}/{total})</div>"
+    )
+
+def _badge(num: int, color_bg: str, color_text: str = "#111827") -> str:
+    return f"<span style='display:inline-block;padding:3px 8px;border-radius:9999px;background:{color_bg};color:{color_text};font-size:12px'>{num}</span>"
 
 def _norm_role(raw: str) -> str:
     s = (raw or "").strip().lower()
@@ -628,23 +678,34 @@ def _build_cumulative_summary(db: Session, plan_id: str, cutoff_day: int) -> Tup
 
     def tabulate(mapping: Dict[str, Dict[str,int]], title: str) -> str:
         rows = []
-        rows.append(f"<h3>{title}</h3>")
-        rows.append("<table border='0' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:Arial;font-size:14px;width:100%'>")
-        rows.append("<tr style='background:#f3f4f6'><th align='left'>Name</th><th>Done</th><th>In-prog</th><th>Pending</th><th>Total</th><th>% Done</th></tr>")
+        rows.append(f"<h3 style='margin:14px 0 6px 0'>{title}</h3>")
+        rows.append(
+            "<table border='0' cellpadding='6' cellspacing='0' "
+            "style='border-collapse:collapse;font-family:Arial;font-size:14px;width:100%'>"
+        )
+        rows.append("<tr style='background:#f3f4f6'>"
+                    "<th align='left'>Name</th>"
+                    "<th>Done</th><th>In-prog</th><th>Pending</th><th>Total</th><th>% Done</th><th align='left'>Visual</th></tr>")
         for name in sorted(mapping.keys()):
             m = mapping[name]
             rows.append(
-                f"<tr><td>{name}</td><td align='center'>{m['done']}</td><td align='center'>{m['inprog']}</td>"
-                f"<td align='center'>{m['pending']}</td><td align='center'>{m['total']}</td>"
-                f"<td align='center'>{pct(m['done'], m['total'])}</td></tr>"
+                "<tr>"
+                f"<td>{name}</td>"
+                f"<td align='center'>{_badge(m['done'], '#d1fae5', '#065f46')}</td>"
+                f"<td align='center'>{_badge(m['inprog'], '#fef3c7', '#92400e')}</td>"
+                f"<td align='center'>{_badge(m['pending'], '#e5e7eb', '#374151')}</td>"
+                f"<td align='center'><b>{m['total']}</b></td>"
+                f"<td align='center'>{pct(m['done'], m['total'])}</td>"
+                f"<td>{_stacked_bar(m['done'], m['inprog'], m['pending'])}</td>"
+                "</tr>"
             )
         if not mapping:
-            rows.append("<tr><td colspan='6' style='color:#6b7280'>No tasks scheduled yet.</td></tr>")
+            rows.append("<tr><td colspan='7' style='color:#6b7280'>No tasks scheduled yet.</td></tr>")
         rows.append("</table>")
         return "\n".join(rows)
 
     # pending lists (top 5 per area, oldest first)
-    pend_html = ["<h3>Key pending items by area (oldest first)</h3>"]
+    pend_html = ["<h3 style='margin:14px 0 6px 0'>Key pending items by area (oldest first)</h3>"]
     if not pendings:
         pend_html.append("<p style='color:#6b7280'>None.</p>")
     else:
@@ -655,16 +716,26 @@ def _build_cumulative_summary(db: Session, plan_id: str, cutoff_day: int) -> Tup
             lis = []
             for it in items:
                 dt = _date_for_day(start_date, it["day"]).strftime("%d %b")
-                lis.append(f"<li>Day {it['day']} ({dt}) — {it['task']} <span style='color:#6b7280'>( {it['role'] or '—'}, {it['progress']}% )</span></li>")
+                lis.append(f"<li>Day {it['day']} ({dt}) — {it['task']} "
+                           f"<span style='color:#6b7280'>( {it['role'] or '—'}, {it['progress']}% )</span></li>")
             pend_html.append(f"<p style='margin:10px 0 4px 0'><b>{area}</b></p><ul>{''.join(lis) or '<li>—</li>'}</ul>")
         pend_html.append("</div>")
 
-    overall = f"{pct(total_done, total_all)} (Done {total_done} / {total_all})"
+    # header KPIs + overall bar
+    header_box = (
+        "<div style='display:flex;gap:14px;align-items:center;margin:6px 0 12px 0'>"
+        f"{_single_bar(total_done, total_all)}"
+        f"<div style='font-size:12px;color:#6b7280'>Legend:&nbsp;"
+        "<span style='display:inline-block;width:10px;height:10px;background:#10b981;border-radius:2px;margin-right:4px'></span>Done&nbsp;"
+        "<span style='display:inline-block;width:10px;height:10px;background:#f59e0b;border-radius:2px;margin:0 4px 0 12px'></span>In-prog&nbsp;"
+        "<span style='display:inline-block;width:10px;height:10px;background:#cfd4dc;border-radius:2px;margin:0 4px 0 12px'></span>Pending"
+        "</div></div>"
+    )
 
     html = f"""
     <div style="font-family:Arial,Helvetica,sans-serif">
       <h2 style="margin:0 0 8px 0">Daily Summary (cumulative up to yesterday)</h2>
-      <p style="margin:4px 0 12px 0"><b>Overall progress:</b> {overall}</p>
+      {header_box}
       {tabulate(per_area, "Per-area cumulative")}
       <div style="height:12px"></div>
       {tabulate(per_role, "Per-trade cumulative")}
@@ -715,7 +786,7 @@ def _build_carryover_block(db: Session, plan_id: str) -> str:
         by_area[e.get("area","")] = by_area.get(e.get("area",""), 0) + len(e.get("items") or [])
 
     rows = []
-    rows.append("<h3>Carry-overs from last night’s rollover</h3>")
+    rows.append("<h3 style='margin:14px 0 6px 0'>Carry-overs from last night’s rollover</h3>")
     rows.append(f"<p style='margin:0 0 8px 0;color:#374151'>Moved {sum(by_area.values())} item(s) from Day {log.from_day} → {log.to_day}.</p>")
     rows.append("<table border='0' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:Arial;font-size:14px;width:100%'>")
     rows.append("<tr style='background:#f3f4f6'><th align='left'>Area</th><th align='left'>Items</th></tr>")
@@ -787,7 +858,7 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
     for d in range(start_day, start_day + span):
         the_date = _date_for_day(start_date, d).strftime("%d %b %Y")
         section = [
-            f"<h3>Day {d} — {the_date}</h3>",
+            f"<h3 style='margin:14px 0 6px 0'>Day {d} — {the_date}</h3>",
             "<table border='0' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:Arial;font-size:14px;width:100%'>",
             "<tr style='background:#f3f4f6'><th align='left'>Area</th><th align='left'>Task</th><th align='left'>Role</th>"
             "<th align='left'>Workers</th><th align='left'>Hours</th><th align='left'>Progress</th></tr>"
@@ -998,8 +1069,9 @@ def send_daily_email(
 ):
     try:
         with SessionLocal() as db:
-            start_date = _get_start_date_for_plan(db, plan_id)
-            today_idx = int(start_day) if (start_day and start_day >= 1) else max(1, _workday_index(start_date, _today_local()))
+            # --- FIX: choose today's day via rollover log if available
+            today_idx = int(start_day) if (start_day and start_day >= 1) else _current_plan_day(db, plan_id)
+            start_date = _get_start_date_for_plan(db, plan_id)  # for pretty dates
             cutoff = max(0, today_idx - 1)  # cumulative up to yesterday
 
             # 1) Summary (cumulative up to 'cutoff')
@@ -1211,8 +1283,9 @@ if HAVE_SCHEDULER:
         def job_email():
             try:
                 with SessionLocal() as db:
+                    # --- FIX here as well: use rollover-informed day
+                    today_day = _current_plan_day(db, DEFAULT_PLAN_ID)
                     start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
-                    today_day = max(1, _workday_index(start_date, _today_local()))
                     cutoff = max(0, today_day - 1)
                     summary_html, summary_csv = _build_cumulative_summary(db, DEFAULT_PLAN_ID, cutoff)
                     carry_html = _build_carryover_block(db, DEFAULT_PLAN_ID)
@@ -1252,9 +1325,9 @@ if HAVE_SCHEDULER:
                         print(f"Rollover: yesterday {yday} was OFF – skipping.")
                         return
                     from_day = _workday_index(start_date, yday)
-                    moved = _rollover_incomplete(db, DEFAULT_PLAN_ID, from_day)
-                    # log it
-                    log = RolloverLog(plan_id=DEFAULT_PLAN_ID, from_day=from_day, to_day=from_day+1, moved=[])
+                    moved, detail = _rollover_incomplete_with_detail(db, DEFAULT_PLAN_ID, from_day)
+                    # log it with detail so carry-overs appear in the email block
+                    log = RolloverLog(plan_id=DEFAULT_PLAN_ID, from_day=from_day, to_day=from_day+1, moved=detail)
                     db.add(log); db.commit()
                     print(f"Rollover moved {moved} item(s) from Day {from_day} → {from_day + 1}.")
             except Exception as e:
