@@ -1,3 +1,4 @@
+# ---------- app.py (updated) ----------
 import os
 import csv
 import io
@@ -206,6 +207,14 @@ def _today_local() -> date:
     except Exception:
         return datetime.now().date()
 
+def _now_local_dt() -> datetime:
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(TIMEZONE)
+        return datetime.now(tz)
+    except Exception:
+        return datetime.now()
+
 def _get_start_date_for_plan(db: Session, plan_id: str) -> date:
     p = db.get(Plan, plan_id)
     if p and p.start_date:
@@ -238,29 +247,6 @@ def _workday_index(start: date, d: date) -> int:
         if not _is_off(cur):
             idx += 1
     return idx
-
-# --- NEW: robust "what day is today?" using RolloverLog ---
-def _current_plan_day(db: Session, plan_id: str) -> int:
-    """
-    Prefer the most recent rollover's to_day; fallback to start_date→workday index.
-    """
-    last = (
-        db.query(RolloverLog)
-          .filter(RolloverLog.plan_id == plan_id)
-          .order_by(RolloverLog.id.desc())
-          .first()
-    )
-    if last and isinstance(last.to_day, int):
-        try:
-            # If the log is very old (>3 days), ignore and fall back.
-            if last.created_at and (datetime.utcnow() - last.created_at.replace(tzinfo=None)) > timedelta(days=3):
-                pass
-            else:
-                return max(1, int(last.to_day))
-        except Exception:
-            return max(1, int(last.to_day))
-    start_date = _get_start_date_for_plan(db, plan_id)
-    return max(1, _workday_index(start_date, _today_local()))
 
 def _fetch_cells_range(db: Session, plan_id: str, from_day: int, to_day: int):
     rows = (
@@ -387,6 +373,52 @@ def _canon(x):
         return json.dumps(x, sort_keys=True, ensure_ascii=False)
     except Exception:
         return str(x)
+
+# ---------- NEW: derive "today" from latest rollover if recent ----------
+def _latest_rollover_day(db: Session, plan_id: str) -> Optional[Tuple[int, datetime]]:
+    log = (
+        db.query(RolloverLog)
+          .filter(RolloverLog.plan_id == plan_id)
+          .order_by(RolloverLog.id.desc())
+          .first()
+    )
+    if not log:
+        return None
+    return (int(log.to_day or 0), log.created_at)
+
+def _today_workday_for_email(db: Session, plan_id: str, override_start_day: Optional[int] = None) -> int:
+    """
+    Priority:
+      1) explicit ?start_day= from UI (if provided)
+      2) if there's a recent rollover log (<=36h old), use its 'to_day'
+      3) fall back to workday index computed from plan.start_date and today's local date
+    """
+    if override_start_day and override_start_day >= 1:
+        return int(override_start_day)
+
+    # try recent rollover
+    lr = _latest_rollover_day(db, plan_id)
+    if lr:
+        to_day, created_at = lr
+        try:
+            # treat as recent if within 36 hours from now (local TZ)
+            now_local = _now_local_dt()
+            ca = created_at
+            if ca.tzinfo is None:
+                # created_at should be timezone-aware from DB; if not, compare naive times
+                delta = now_local.replace(tzinfo=None) - ca
+            else:
+                delta = now_local.astimezone(ca.tzinfo) - ca
+            if delta <= timedelta(hours=36) and to_day >= 1:
+                return to_day
+        except Exception:
+            # if anything odd, still accept the to_day
+            if to_day >= 1:
+                return to_day
+
+    # fallback: compute by start_date
+    start_date = _get_start_date_for_plan(db, plan_id)
+    return max(1, _workday_index(start_date, _today_local()))
 
 # =========================
 # Rollover (append-only)
@@ -581,35 +613,8 @@ def checklist_progress(payload: ChecklistProgressUpdateIn, token: Optional[str] 
     return {"ok": True, "updated": updated}
 
 # =========================
-# Email builders + senders (with visuals)
+# Email builders + senders
 # =========================
-
-# small helpers for visual bars (inline styles for email clients)
-def _stacked_bar(done: int, inprog: int, pending: int) -> str:
-    total = max(1, int(done + inprog + pending))
-    pd = int(round(100 * done / total))
-    pi = int(round(100 * inprog / total))
-    pp = max(0, 100 - pd - pi)
-    # colors: green (#10b981), amber (#f59e0b), gray (#e5e7eb)
-    return (
-        "<div style='width:160px;height:10px;background:#e5e7eb;border-radius:6px;overflow:hidden'>"
-        f"<div style='height:10px;width:{pd}%;background:#10b981;float:left'></div>"
-        f"<div style='height:10px;width:{pi}%;background:#f59e0b;float:left'></div>"
-        f"<div style='height:10px;width:{pp}%;background:#cfd4dc;float:left'></div>"
-        "</div>"
-    )
-
-def _single_bar(done: int, total: int) -> str:
-    pct = int(round(100 * (done / total))) if total else 0
-    return (
-        "<div style='width:360px;height:12px;background:#e5e7eb;border-radius:8px;overflow:hidden'>"
-        f"<div style='height:12px;width:{pct}%;background:#2563eb'></div>"
-        "</div>"
-        f"<div style='font-size:12px;color:#374151;margin-top:4px'>{pct}% complete (Done {done}/{total})</div>"
-    )
-
-def _badge(num: int, color_bg: str, color_text: str = "#111827") -> str:
-    return f"<span style='display:inline-block;padding:3px 8px;border-radius:9999px;background:{color_bg};color:{color_text};font-size:12px'>{num}</span>"
 
 def _norm_role(raw: str) -> str:
     s = (raw or "").strip().lower()
@@ -645,6 +650,14 @@ def _iter_tasks_upto(db: Session, plan_id: str, thru_day: int):
             t = _normalize_task(s)
             yield area, int(day), t
 
+def _simple_bar(percent: float, w: int = 80, h: int = 8, color: str = "#10b981") -> str:
+    pct = max(0.0, min(100.0, float(percent)))
+    return (
+        f"<div style='width:{w}px;height:{h}px;background:#e5e7eb;border-radius:999px;overflow:hidden;display:inline-block;vertical-align:middle'>"
+        f"<div style='width:{pct}%;height:{h}px;background:{color}'></div></div>"
+        f"<span style='display:inline-block;margin-left:6px;color:#374151;font-size:12px'>{pct:.1f}%</span>"
+    )
+
 def _build_cumulative_summary(db: Session, plan_id: str, cutoff_day: int) -> Tuple[str, bytes]:
     # tallies
     per_area: Dict[str, Dict[str,int]] = {}
@@ -674,38 +687,29 @@ def _build_cumulative_summary(db: Session, plan_id: str, cutoff_day: int) -> Tup
             })
 
     # build HTML
-    def pct(a,b): return f"{round((100.0*a/b),1)}%" if b>0 else "—"
+    def pct(a,b): return (100.0*a/b) if b>0 else 0.0
 
     def tabulate(mapping: Dict[str, Dict[str,int]], title: str) -> str:
         rows = []
-        rows.append(f"<h3 style='margin:14px 0 6px 0'>{title}</h3>")
-        rows.append(
-            "<table border='0' cellpadding='6' cellspacing='0' "
-            "style='border-collapse:collapse;font-family:Arial;font-size:14px;width:100%'>"
-        )
-        rows.append("<tr style='background:#f3f4f6'>"
-                    "<th align='left'>Name</th>"
-                    "<th>Done</th><th>In-prog</th><th>Pending</th><th>Total</th><th>% Done</th><th align='left'>Visual</th></tr>")
+        rows.append(f"<h3 style='margin:10px 0'>{title}</h3>")
+        rows.append("<table border='0' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:Arial;font-size:14px;width:100%'>")
+        rows.append("<tr style='background:#f3f4f6'><th align='left'>Name</th><th>Done</th><th>In-prog</th><th>Pending</th><th>Total</th><th align='left'>Progress</th></tr>")
         for name in sorted(mapping.keys()):
             m = mapping[name]
+            pr = pct(m['done'], m['total'])
+            bar = _simple_bar(pr)
             rows.append(
-                "<tr>"
-                f"<td>{name}</td>"
-                f"<td align='center'>{_badge(m['done'], '#d1fae5', '#065f46')}</td>"
-                f"<td align='center'>{_badge(m['inprog'], '#fef3c7', '#92400e')}</td>"
-                f"<td align='center'>{_badge(m['pending'], '#e5e7eb', '#374151')}</td>"
-                f"<td align='center'><b>{m['total']}</b></td>"
-                f"<td align='center'>{pct(m['done'], m['total'])}</td>"
-                f"<td>{_stacked_bar(m['done'], m['inprog'], m['pending'])}</td>"
-                "</tr>"
+                f"<tr><td>{name}</td><td align='center'>{m['done']}</td><td align='center'>{m['inprog']}</td>"
+                f"<td align='center'>{m['pending']}</td><td align='center'>{m['total']}</td>"
+                f"<td align='left'>{bar}</td></tr>"
             )
         if not mapping:
-            rows.append("<tr><td colspan='7' style='color:#6b7280'>No tasks scheduled yet.</td></tr>")
+            rows.append("<tr><td colspan='6' style='color:#6b7280'>No tasks scheduled yet.</td></tr>")
         rows.append("</table>")
         return "\n".join(rows)
 
     # pending lists (top 5 per area, oldest first)
-    pend_html = ["<h3 style='margin:14px 0 6px 0'>Key pending items by area (oldest first)</h3>"]
+    pend_html = ["<h3 style='margin:12px 0 6px 0'>Key pending items by area (oldest first)</h3>"]
     if not pendings:
         pend_html.append("<p style='color:#6b7280'>None.</p>")
     else:
@@ -716,26 +720,17 @@ def _build_cumulative_summary(db: Session, plan_id: str, cutoff_day: int) -> Tup
             lis = []
             for it in items:
                 dt = _date_for_day(start_date, it["day"]).strftime("%d %b")
-                lis.append(f"<li>Day {it['day']} ({dt}) — {it['task']} "
-                           f"<span style='color:#6b7280'>( {it['role'] or '—'}, {it['progress']}% )</span></li>")
+                lis.append(f"<li>Day {it['day']} ({dt}) — {it['task']} <span style='color:#6b7280'>( {it['role'] or '—'}, {it['progress']}% )</span></li>")
             pend_html.append(f"<p style='margin:10px 0 4px 0'><b>{area}</b></p><ul>{''.join(lis) or '<li>—</li>'}</ul>")
         pend_html.append("</div>")
 
-    # header KPIs + overall bar
-    header_box = (
-        "<div style='display:flex;gap:14px;align-items:center;margin:6px 0 12px 0'>"
-        f"{_single_bar(total_done, total_all)}"
-        f"<div style='font-size:12px;color:#6b7280'>Legend:&nbsp;"
-        "<span style='display:inline-block;width:10px;height:10px;background:#10b981;border-radius:2px;margin-right:4px'></span>Done&nbsp;"
-        "<span style='display:inline-block;width:10px;height:10px;background:#f59e0b;border-radius:2px;margin:0 4px 0 12px'></span>In-prog&nbsp;"
-        "<span style='display:inline-block;width:10px;height:10px;background:#cfd4dc;border-radius:2px;margin:0 4px 0 12px'></span>Pending"
-        "</div></div>"
-    )
+    overall_pct = pct(total_done, total_all)
+    overall_bar = _simple_bar(overall_pct, w=160, h=10)
 
     html = f"""
     <div style="font-family:Arial,Helvetica,sans-serif">
       <h2 style="margin:0 0 8px 0">Daily Summary (cumulative up to yesterday)</h2>
-      {header_box}
+      <div style="margin:4px 0 12px 0"><b>Overall progress:</b> {overall_bar}</div>
       {tabulate(per_area, "Per-area cumulative")}
       <div style="height:12px"></div>
       {tabulate(per_role, "Per-trade cumulative")}
@@ -773,7 +768,7 @@ def _build_carryover_block(db: Session, plan_id: str) -> str:
     )
     if not log or not (log.moved or []):
         return ""
-    # if this log is older than ~36h, hide (when "email now" is hit much later)
+    # hide if older than ~36h
     try:
         if log.created_at and (datetime.utcnow() - log.created_at.replace(tzinfo=None)) > timedelta(hours=36):
             return ""
@@ -786,7 +781,7 @@ def _build_carryover_block(db: Session, plan_id: str) -> str:
         by_area[e.get("area","")] = by_area.get(e.get("area",""), 0) + len(e.get("items") or [])
 
     rows = []
-    rows.append("<h3 style='margin:14px 0 6px 0'>Carry-overs from last night’s rollover</h3>")
+    rows.append("<h3>Carry-overs from last night’s rollover</h3>")
     rows.append(f"<p style='margin:0 0 8px 0;color:#374151'>Moved {sum(by_area.values())} item(s) from Day {log.from_day} → {log.to_day}.</p>")
     rows.append("<table border='0' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:Arial;font-size:14px;width:100%'>")
     rows.append("<tr style='background:#f3f4f6'><th align='left'>Area</th><th align='left'>Items</th></tr>")
@@ -858,7 +853,7 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
     for d in range(start_day, start_day + span):
         the_date = _date_for_day(start_date, d).strftime("%d %b %Y")
         section = [
-            f"<h3 style='margin:14px 0 6px 0'>Day {d} — {the_date}</h3>",
+            f"<h3>Day {d} — {the_date}</h3>",
             "<table border='0' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:Arial;font-size:14px;width:100%'>",
             "<tr style='background:#f3f4f6'><th align='left'>Area</th><th align='left'>Task</th><th align='left'>Role</th>"
             "<th align='left'>Workers</th><th align='left'>Hours</th><th align='left'>Progress</th></tr>"
@@ -1069,9 +1064,9 @@ def send_daily_email(
 ):
     try:
         with SessionLocal() as db:
-            # --- FIX: choose today's day via rollover log if available
-            today_idx = int(start_day) if (start_day and start_day >= 1) else _current_plan_day(db, plan_id)
-            start_date = _get_start_date_for_plan(db, plan_id)  # for pretty dates
+            # NEW: derive today's working day (respects latest rollover)
+            today_idx = _today_workday_for_email(db, plan_id, start_day)
+            start_date = _get_start_date_for_plan(db, plan_id)
             cutoff = max(0, today_idx - 1)  # cumulative up to yesterday
 
             # 1) Summary (cumulative up to 'cutoff')
@@ -1283,8 +1278,8 @@ if HAVE_SCHEDULER:
         def job_email():
             try:
                 with SessionLocal() as db:
-                    # --- FIX here as well: use rollover-informed day
-                    today_day = _current_plan_day(db, DEFAULT_PLAN_ID)
+                    # NEW: use same “today” logic as manual route
+                    today_day = _today_workday_for_email(db, DEFAULT_PLAN_ID, None)
                     start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
                     cutoff = max(0, today_day - 1)
                     summary_html, summary_csv = _build_cumulative_summary(db, DEFAULT_PLAN_ID, cutoff)
@@ -1325,9 +1320,9 @@ if HAVE_SCHEDULER:
                         print(f"Rollover: yesterday {yday} was OFF – skipping.")
                         return
                     from_day = _workday_index(start_date, yday)
-                    moved, detail = _rollover_incomplete_with_detail(db, DEFAULT_PLAN_ID, from_day)
-                    # log it with detail so carry-overs appear in the email block
-                    log = RolloverLog(plan_id=DEFAULT_PLAN_ID, from_day=from_day, to_day=from_day+1, moved=detail)
+                    moved = _rollover_incomplete(db, DEFAULT_PLAN_ID, from_day)
+                    # log it
+                    log = RolloverLog(plan_id=DEFAULT_PLAN_ID, from_day=from_day, to_day=from_day+1, moved=[])
                     db.add(log); db.commit()
                     print(f"Rollover moved {moved} item(s) from Day {from_day} → {from_day + 1}.")
             except Exception as e:
@@ -1338,3 +1333,4 @@ if HAVE_SCHEDULER:
         scheduler.start()
     except Exception as e:
         print("Scheduler not started:", e)
+# ---------- end app.py ----------
