@@ -1060,13 +1060,27 @@ def email_ping():
 def send_daily_email(
     plan_id: str = DEFAULT_PLAN_ID,
     span: int = 3,
-    start_day: Optional[int] = Query(None)  # UI may pass ?start_day=
+    start_day: Optional[int] = Query(None)  # optional override from UI
 ):
+    """
+    Builds 'Summary + (Today+next span-1) checklist' and emails it.
+    We compute the authoritative 'today_idx' using server workday logic.
+    If the UI sends a start_day that's close (±1) we allow it; otherwise we ignore it.
+    """
     try:
         with SessionLocal() as db:
-            # NEW: derive today's working day (respects latest rollover)
-            today_idx = _today_workday_for_email(db, plan_id, start_day)
             start_date = _get_start_date_for_plan(db, plan_id)
+
+            # server-truth for today's workday index (Sundays/holidays skipped)
+            server_today = max(1, _workday_index(start_date, _today_local()))
+
+            # if UI sent something wildly off (like raw calendar diff), ignore it
+            requested = int(start_day) if (start_day and start_day >= 1) else None
+            if requested is not None and abs(requested - server_today) <= 1:
+                today_idx = requested
+            else:
+                today_idx = server_today
+
             cutoff = max(0, today_idx - 1)  # cumulative up to yesterday
 
             # 1) Summary (cumulative up to 'cutoff')
@@ -1103,6 +1117,7 @@ def send_daily_email(
             return {"ok": True, "day": today_idx}
     except Exception as e:
         raise HTTPException(500, detail=str(e))
+
 
 @ops.post("/rollover", dependencies=[Depends(require_key)])
 def rollover(plan_id: str = DEFAULT_PLAN_ID):
