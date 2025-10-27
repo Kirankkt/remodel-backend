@@ -558,12 +558,14 @@ class ChecklistProgressItem(BaseModel):
     index: conint(ge=0)
     progress: conint(ge=0, le=100)
 
-class ProgressUpdateIn(BaseModel):
+class ChecklistProgressUpdateIn(BaseModel):
     plan_id: str = DEFAULT_PLAN_ID
     items: List[ChecklistProgressItem]
 
+
 @ops.post("/checklist_progress")
-def checklist_progress(payload: ProgressUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
+def checklist_progress(payload: ChecklistProgressUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
+
     if not CHECK_TOKEN or token != CHECK_TOKEN:
         raise HTTPException(401, "Invalid token")
 
