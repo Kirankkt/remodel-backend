@@ -1070,13 +1070,21 @@ if HAVE_SCHEDULER:
             try:
                 with SessionLocal() as db:
                     start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
-                    # Roll yesterday -> today using previous workday index
-                    today_idx = _workday_index(start_date, _today_local())
-                    from_day  = max(1, today_idx - 1)
+        
+                    today = _today_local()
+                    yday = today - timedelta(days=1)
+        
+                    # Only roll if YESTERDAY was a workday. (Prevents double-roll on Mon after Sun.)
+                    if _is_off(yday):
+                        print(f"Rollover: yesterday {yday} was OFF – skipping.")
+                        return
+        
+                    from_day = _workday_index(start_date, yday)  # roll 'yesterday' -> next workday
                     moved = _rollover_incomplete(db, DEFAULT_PLAN_ID, from_day)
-                    print(f"Rollover moved {moved} item(s) from Day {from_day} → {from_day+1}.")
+                    print(f"Rollover moved {moved} item(s) from Day {from_day} → {from_day + 1}.")
             except Exception as e:
                 print("Evening rollover failed:", e)
+
 
         scheduler.add_job(job_email,    CronTrigger(hour=7,  minute=0, timezone=TZ))
         scheduler.add_job(job_rollover, CronTrigger(hour=0,  minute=0, timezone=TZ))
