@@ -648,13 +648,15 @@ def _iter_tasks_upto(db: Session, plan_id: str, thru_day: int):
             t = _normalize_task(s)
             yield area, int(day), t
 
-def _simple_bar(percent: float, w: int = 80, h: int = 8, color: str = "#10b981") -> str:
+def _simple_bar(percent: float, w: int = 240, h: int = 14, color: str = "#16a34a") -> str:
     pct = max(0.0, min(100.0, float(percent)))
     return (
-        f"<div style='width:{w}px;height:{h}px;background:#e5e7eb;border-radius:999px;overflow:hidden;display:inline-block;vertical-align:middle'>"
+        f"<div style='width:{w}px;height:{h}px;background:#f3f4f6;border:1px solid #e5e7eb;"
+        f"border-radius:10px;overflow:hidden;display:inline-block;vertical-align:middle'>"
         f"<div style='width:{pct}%;height:{h}px;background:{color}'></div></div>"
-        f"<span style='display:inline-block;margin-left:6px;color:#374151;font-size:12px'>{pct:.1f}%</span>"
+        f"<span style='display:inline-block;margin-left:8px;color:#111827;font-size:12px;font-weight:600'>{pct:.1f}%</span>"
     )
+
 
 def _build_cumulative_summary(db: Session, plan_id: str, cutoff_day: int) -> Tuple[str, bytes]:
     # tallies
@@ -684,48 +686,64 @@ def _build_cumulative_summary(db: Session, plan_id: str, cutoff_day: int) -> Tup
                 "day": day, "task": t["name"], "role": t["role"], "progress": int(t["progress"])
             })
 
-    # build HTML
     def pct(a,b): return (100.0*a/b) if b>0 else 0.0
 
-    def tabulate(mapping: Dict[str, Dict[str,int]], title: str) -> str:
-            rows = []
-            rows.append(f"<h3>{title}</h3>")
-            rows.append("<table border='0' cellpadding='6' cellspacing='0' "
-                        "style='border-collapse:collapse;font-family:Arial;font-size:14px;width:100%'>")
-            rows.append("<tr style='background:#f3f4f6'>"
-                        "<th align='left'>Name</th><th>Done</th><th>In-prog</th><th>Pending</th>"
-                        "<th>Total</th><th>% Done</th><th align='left'>Mix</th></tr>")
-            for name in sorted(mapping.keys()):
-                m = mapping[name]
-                total = max(1, m['total'])
-                pct_done   = round(100.0 * m['done']   / total, 1)
-                pct_inprog = round(100.0 * m['inprog'] / total, 1)
-                pct_pend   = round(100.0 * m['pending']/ total, 1)
-                bar = (
-                  "<div style='width:160px;background:#e5e7eb;border-radius:8px;overflow:hidden;height:8px;display:inline-block'>"
-                  f"<div style='width:{pct_done}%;height:8px;background:#10b981;display:inline-block'></div>"
-                  f"<div style='width:{pct_inprog}%;height:8px;background:#f59e0b;display:inline-block'></div>"
-                  f"<div style='width:{pct_pend}%;height:8px;background:#9ca3af;display:inline-block'></div>"
-                  "</div>"
-                )
-                rows.append(
-                    f"<tr>"
-                    f"<td>{name}</td>"
-                    f"<td align='center'>{m['done']}</td>"
-                    f"<td align='center'>{m['inprog']}</td>"
-                    f"<td align='center'>{m['pending']}</td>"
-                    f"<td align='center'>{m['total']}</td>"
-                    f"<td align='center'>{pct_done}%</td>"
-                    f"<td>{bar}</td>"
-                    f"</tr>"
-                )
-            if not mapping:
-                rows.append("<tr><td colspan='7' style='color:#6b7280'>No tasks scheduled yet.</td></tr>")
-            rows.append("</table>")
-            return "\n".join(rows)
+    # ---------- legend (clear, high-contrast) ----------
+    legend = (
+      "<div style='margin:6px 0 12px 0;font-size:12px;color:#374151'>"
+      "<span style='display:inline-block;padding:4px 8px;border-radius:6px;background:#16a34a;color:white;margin-right:8px'>Done</span>"
+      "<span style='display:inline-block;padding:4px 8px;border-radius:6px;background:#eab308;color:#111827;margin-right:8px'>In-progress</span>"
+      "<span style='display:inline-block;padding:4px 8px;border-radius:6px;background:#cbd5e1;color:#111827'>Pending</span>"
+      "</div>"
+    )
 
-    # pending lists (top 5 per area, oldest first)
-    pend_html = ["<h3 style='margin:12px 0 6px 0'>Key pending items by area (oldest first)</h3>"]
+    # ---------- table builder with THICK stacked bar and labels ----------
+    def tabulate(mapping: Dict[str, Dict[str,int]], title: str) -> str:
+        rows = []
+        rows.append(f"<h3 style='margin:12px 0 8px 0'>{title}</h3>")
+        rows.append(legend)
+        rows.append(
+            "<table border='0' cellpadding='8' cellspacing='0' "
+            "style='border-collapse:collapse;font-family:Arial;font-size:14px;width:100%'>"
+            "<tr style='background:#f8fafc'>"
+            "<th align='left'>Name</th><th>Done</th><th>In-prog</th><th>Pending</th>"
+            "<th>Total</th><th>% Done</th><th align='left'>Mix</th></tr>"
+        )
+        for name in sorted(mapping.keys()):
+            m = mapping[name]
+            total = max(1, m['total'])
+            pct_done   = round(100.0 * m['done']   / total, 1)
+            pct_inprog = round(100.0 * m['inprog'] / total, 1)
+            pct_pend   = round(100.0 * m['pending']/ total, 1)
+            bar = (
+              "<div style='width:260px;background:#f3f4f6;border:1px solid #e5e7eb;border-radius:10px;"
+              "overflow:hidden;height:14px;display:inline-block;vertical-align:middle'>"
+              f"<div style='width:{pct_done}%;height:14px;background:#16a34a;display:inline-block'></div>"
+              f"<div style='width:{pct_inprog}%;height:14px;background:#eab308;display:inline-block'></div>"
+              f"<div style='width:{pct_pend}%;height:14px;background:#cbd5e1;display:inline-block'></div>"
+              "</div>"
+              f"<span style='margin-left:8px;font-size:12px;color:#374151'>"
+              f"{pct_done}% · {pct_inprog}% · {pct_pend}%"
+              "</span>"
+            )
+            rows.append(
+                f"<tr>"
+                f"<td>{name}</td>"
+                f"<td align='center'><span style='color:#16a34a;font-weight:600'>{m['done']}</span></td>"
+                f"<td align='center'><span style='color:#a16207;font-weight:600'>{m['inprog']}</span></td>"
+                f"<td align='center'><span style='color:#475569;font-weight:600'>{m['pending']}</span></td>"
+                f"<td align='center'>{m['total']}</td>"
+                f"<td align='center'>{pct_done}%</td>"
+                f"<td>{bar}</td>"
+                f"</tr>"
+            )
+        if not mapping:
+            rows.append("<tr><td colspan='7' style='color:#6b7280'>No tasks scheduled yet.</td></tr>")
+        rows.append("</table>")
+        return "\n".join(rows)
+
+    # ---------- pending (top 5 per area) ----------
+    pend_html = ["<h3 style='margin:16px 0 8px 0'>Key pending items by area (oldest first)</h3>"]
     if not pendings:
         pend_html.append("<p style='color:#6b7280'>None.</p>")
     else:
@@ -736,26 +754,29 @@ def _build_cumulative_summary(db: Session, plan_id: str, cutoff_day: int) -> Tup
             lis = []
             for it in items:
                 dt = _date_for_day(start_date, it["day"]).strftime("%d %b")
-                lis.append(f"<li>Day {it['day']} ({dt}) — {it['task']} <span style='color:#6b7280'>( {it['role'] or '—'}, {it['progress']}% )</span></li>")
+                lis.append(
+                    f"<li>Day {it['day']} ({dt}) — {it['task']} "
+                    f"<span style='color:#6b7280'>( {it['role'] or '—'}, {it['progress']}% )</span></li>"
+                )
             pend_html.append(f"<p style='margin:10px 0 4px 0'><b>{area}</b></p><ul>{''.join(lis) or '<li>—</li>'}</ul>")
         pend_html.append("</div>")
 
     overall_pct = pct(total_done, total_all)
-    overall_bar = _simple_bar(overall_pct, w=160, h=10)
+    overall_bar = _simple_bar(overall_pct, w=260, h=14)
 
     html = f"""
     <div style="font-family:Arial,Helvetica,sans-serif">
       <h2 style="margin:0 0 8px 0">Daily Summary (cumulative up to yesterday)</h2>
       <div style="margin:4px 0 12px 0"><b>Overall progress:</b> {overall_bar}</div>
       {tabulate(per_area, "Per-area cumulative")}
-      <div style="height:12px"></div>
+      <div style="height:16px"></div>
       {tabulate(per_role, "Per-trade cumulative")}
-      <div style="height:12px"></div>
+      <div style="height:16px"></div>
       {''.join(pend_html)}
     </div>
     """.strip()
 
-    # CSV (single file with "section" discriminator)
+    # CSV
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["section","name","done","in_progress","pending","total","pct_done"])
@@ -764,8 +785,7 @@ def _build_cumulative_summary(db: Session, plan_id: str, cutoff_day: int) -> Tup
                     (round(100.0*m["done"]/m["total"],1) if m["total"] else "")])
     for name, m in sorted(per_role.items()):
         w.writerow(["role", name, m["done"], m["inprog"], m["pending"], m["total"],
-                    (round(100.0*m["done"]/m["total"],1) if m["total"] else "")])
-    # pending rows
+                    (round(100.0*m["done"]/m["total"],1) if m['total'] else "")])
     w.writerow([])
     w.writerow(["section","area","day","task","role","progress"])
     for area, items in sorted(pendings.items()):
@@ -1120,11 +1140,13 @@ def summary_page(
     btns = ""
     if checklist_url:
         btns += _cta_button(checklist_url, "Open Live Checklist", "#059669")
-    btns += f"<a href='{dl}' download='summary_upto_day{cutoff}.csv' style='margin-left:6px'>Download CSV</a>"
-
+    btns += f"<a href='{dl}' download='summary_upto_day{cutoff}.csv' " \
+            "style='margin-left:8px;text-decoration:none;border:1px solid #e5e7eb;padding:8px 12px;border-radius:8px'>Download CSV</a>"
+    
     html = f"""
     <div style="font-family:Arial,Helvetica,sans-serif;max-width:960px;margin:24px auto;padding:0 8px">
-      <h2 style="margin:0 0 8px 0">Summary Dashboard — Day {today_day} ({today_date})</h2>
+      <h2 style="margin:0 0 6px 0">Summary Dashboard — Day {today_day} ({today_date})</h2>
+      <div style="margin:2px 0 14px 0;color:#6b7280">Live rollups for your plan</div>
       <div>{btns}</div>
       <div style="height:14px"></div>
       {summary_html}
@@ -1134,15 +1156,17 @@ def summary_page(
     """.strip()
     return html
 
+
 # ---------- UPDATED: send_daily_email supports compact + attach_csv ----------
 @ops.get("/send_daily_email", dependencies=[Depends(require_key)])
 def send_daily_email(
     plan_id: str = DEFAULT_PLAN_ID,
     span: int = 3,
     start_day: Optional[int] = Query(None),
-    compact: int = Query(0, description="1 = two-button compact email"),
-    attach_csv: int = Query(1, description="1 = attach CSVs; 0 = no attachments (recommended for compact)")
+    compact: int = Query(1, description="1 = two-button compact email (DEFAULT)"),
+    attach_csv: int = Query(0, description="0 = no CSV attachments (DEFAULT); set 1 to attach")
 ):
+
     """
     Sends either:
       - Full email (summary + carry + 3-day checklist) [default], or
