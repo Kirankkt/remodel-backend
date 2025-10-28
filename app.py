@@ -1,4 +1,4 @@
-# ---------- app.py (updated) ----------
+# ---------- app.py (compact-email enabled) ----------
 import os
 import csv
 import io
@@ -405,14 +405,12 @@ def _today_workday_for_email(db: Session, plan_id: str, override_start_day: Opti
             now_local = _now_local_dt()
             ca = created_at
             if ca.tzinfo is None:
-                # created_at should be timezone-aware from DB; if not, compare naive times
                 delta = now_local.replace(tzinfo=None) - ca
             else:
                 delta = now_local.astimezone(ca.tzinfo) - ca
             if delta <= timedelta(hours=36) and to_day >= 1:
                 return to_day
         except Exception:
-            # if anything odd, still accept the to_day
             if to_day >= 1:
                 return to_day
 
@@ -726,7 +724,6 @@ def _build_cumulative_summary(db: Session, plan_id: str, cutoff_day: int) -> Tup
             rows.append("</table>")
             return "\n".join(rows)
 
-
     # pending lists (top 5 per area, oldest first)
     pend_html = ["<h3 style='margin:12px 0 6px 0'>Key pending items by area (oldest first)</h3>"]
     if not pendings:
@@ -913,6 +910,17 @@ def _build_three_day_report(db: Session, plan_id: str, start_day: int, span: int
 
     return html, csv_bytes
 
+# --- helper for compact email buttons ---
+def _cta_button(url: str, label: str, color: str = "#2563eb") -> str:
+    if not url:
+        return ""
+    return (
+        f"<a href='{url}' "
+        f"style='display:inline-block;margin:6px 10px 12px 0;padding:10px 14px;"
+        f"background:{color};color:#fff;border-radius:8px;text-decoration:none'>"
+        f"{label}</a>"
+    )
+
 def _send_via_smtp(subject: str, html: str, attachments: List[Tuple[str, bytes]]):
     if not (SMTP_HOST and SMTP_USER and SMTP_PASS and (DAILY_TO or RESEND_TO)):
         raise RuntimeError("SMTP not configured (SMTP_HOST/USER/PASS and recipients)")
@@ -1075,44 +1083,133 @@ def email_ping():
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
+# ---------- NEW: Summary Dashboard (server-rendered) ----------
+@ops.get("/summary_page", response_class=HTMLResponse)
+def summary_page(
+    plan_id: str = DEFAULT_PLAN_ID,
+    day: Optional[int] = Query(None),
+    t: Optional[str] = Query(None),
+    x_api_key: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    # auth: api key OR token param (email links use token)
+    if not ((API_KEY and x_api_key == API_KEY) or (CHECK_TOKEN and t == CHECK_TOKEN)):
+        raise HTTPException(401, "Unauthorized")
+
+    # pick day
+    today_day = _today_workday_for_email(db, plan_id, day if (day and day >= 1) else None)
+    start_date = _get_start_date_for_plan(db, plan_id)
+    cutoff = max(0, today_day - 1)
+    summary_html, summary_csv = _build_cumulative_summary(db, plan_id, cutoff)
+    carry_html = _build_carryover_block(db, plan_id)
+
+    # data: URI for CSV download
+    b64 = base64.b64encode(summary_csv).decode("ascii")
+    dl = f"data:text/csv;base64,{b64}"
+
+    # optional checklist deep-link
+    checklist_url = (
+        (FRONTEND_PUBLIC_BASE or "").rstrip("/") +
+        f"/checklist.html?plan={plan_id}&startDay={today_day}&days=3" +
+        (f"&t={CHECK_TOKEN}" if CHECK_TOKEN else "") +
+        (f"&api={BACKEND_PUBLIC_BASE}" if BACKEND_PUBLIC_BASE else "")
+        if FRONTEND_PUBLIC_BASE else ""
+    )
+
+    today_date = _date_for_day(start_date, today_day).strftime("%d %b %Y")
+    btns = ""
+    if checklist_url:
+        btns += _cta_button(checklist_url, "Open Live Checklist", "#059669")
+    btns += f"<a href='{dl}' download='summary_upto_day{cutoff}.csv' style='margin-left:6px'>Download CSV</a>"
+
+    html = f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:960px;margin:24px auto;padding:0 8px">
+      <h2 style="margin:0 0 8px 0">Summary Dashboard — Day {today_day} ({today_date})</h2>
+      <div>{btns}</div>
+      <div style="height:14px"></div>
+      {summary_html}
+      <div style="height:16px"></div>
+      {carry_html}
+    </div>
+    """.strip()
+    return html
+
+# ---------- UPDATED: send_daily_email supports compact + attach_csv ----------
 @ops.get("/send_daily_email", dependencies=[Depends(require_key)])
 def send_daily_email(
     plan_id: str = DEFAULT_PLAN_ID,
     span: int = 3,
-    start_day: Optional[int] = Query(None)  # optional override from UI
+    start_day: Optional[int] = Query(None),
+    compact: int = Query(0, description="1 = two-button compact email"),
+    attach_csv: int = Query(1, description="1 = attach CSVs; 0 = no attachments (recommended for compact)")
 ):
     """
-    Builds 'Summary + (Today+next span-1) checklist' and emails it.
-    We compute the authoritative 'today_idx' using server workday logic.
-    If the UI sends a start_day that's close (±1) we allow it; otherwise we ignore it.
+    Sends either:
+      - Full email (summary + carry + 3-day checklist) [default], or
+      - Compact two-button email (Summary Dashboard + Live Checklist) if compact=1
+
+    Optional:
+      - start_day: UI override (accepted if within ±1 of server truth)
+      - attach_csv: controls whether CSV attachments are included (default 1)
     """
     try:
         with SessionLocal() as db:
             start_date = _get_start_date_for_plan(db, plan_id)
-
-            # server-truth for today's workday index (Sundays/holidays skipped)
             server_today = max(1, _workday_index(start_date, _today_local()))
-
-            # if UI sent something wildly off (like raw calendar diff), ignore it
             requested = int(start_day) if (start_day and start_day >= 1) else None
             if requested is not None and abs(requested - server_today) <= 1:
                 today_idx = requested
             else:
                 today_idx = server_today
 
-            cutoff = max(0, today_idx - 1)  # cumulative up to yesterday
+            cutoff = max(0, today_idx - 1)
+            today_date = _date_for_day(start_date, today_idx).strftime("%d %b %Y")
 
-            # 1) Summary (cumulative up to 'cutoff')
+            if int(compact) == 1:
+                # compact: links only
+                summary_url = (
+                    (BACKEND_PUBLIC_BASE or "").rstrip("/") +
+                    f"/ops/summary_page?plan_id={plan_id}&day={today_idx}" +
+                    (f"&t={CHECK_TOKEN}" if CHECK_TOKEN else "") +
+                    (f"&api={BACKEND_PUBLIC_BASE}" if BACKEND_PUBLIC_BASE else "")
+                ) if BACKEND_PUBLIC_BASE else ""
+
+                checklist_url = (
+                    (FRONTEND_PUBLIC_BASE or "").rstrip("/") +
+                    f"/checklist.html?plan={plan_id}&startDay={today_idx}&days={span}" +
+                    (f"&t={CHECK_TOKEN}" if CHECK_TOKEN else "") +
+                    (f"&api={BACKEND_PUBLIC_BASE}" if BACKEND_PUBLIC_BASE else "")
+                ) if FRONTEND_PUBLIC_BASE else ""
+
+                btns = _cta_button(summary_url, "Open Summary Dashboard")
+                if checklist_url:
+                    btns += _cta_button(checklist_url, "Open Live Checklist", "#059669")
+
+                html = f"""
+                  <div style="font-family:Arial,Helvetica,sans-serif">
+                    <h2 style="margin:0 0 12px 0">Daily Report — Day {today_idx} ({today_date})</h2>
+                    <p style="margin:0 0 10px 0;color:#374151">Click a button to view today’s reports:</p>
+                    {btns}
+                    <div style="height:12px"></div>
+                    <div style="color:#6b7280;font-size:12px">If the buttons don't open, copy these links:<br>
+                      <div style="word-break:break-all"><b>Summary:</b> {summary_url or '—'}</div>
+                      {('<div style="word-break:break-all"><b>Checklist:</b> '+checklist_url+'</div>') if checklist_url else ''}
+                    </div>
+                  </div>
+                """.strip()
+
+                _send_email(
+                    subject=f"[{plan_id}] Daily report — Day {today_idx}",
+                    html=html,
+                    attachments=[] if int(attach_csv) == 0 else []
+                )
+                return {"ok": True, "day": today_idx, "mode": "compact"}
+
+            # legacy full email (default)
             summary_html, summary_csv = _build_cumulative_summary(db, plan_id, cutoff)
-
-            # 2) Carry-overs (last midnight)
             carry_html = _build_carryover_block(db, plan_id)
-
-            # 3) 3-day checklist starting today
             checklist_html, checklist_csv = _build_three_day_report(db, plan_id, today_idx, span=span)
 
-            # Combine HTML
-            today_date = _date_for_day(start_date, today_idx).strftime("%d %b %Y")
             html = f"""
               <div style="font-family:Arial,Helvetica,sans-serif">
                 <h2 style="margin:0 0 12px 0">Daily Report — Day {today_idx} ({today_date})</h2>
@@ -1131,9 +1228,9 @@ def send_daily_email(
                 attachments=[
                     (f"checklist_day{today_idx}.csv", checklist_csv),
                     (f"summary_upto_day{cutoff}.csv", summary_csv),
-                ],
+                ] if int(attach_csv) == 1 else []
             )
-            return {"ok": True, "day": today_idx}
+            return {"ok": True, "day": today_idx, "mode": "full"}
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
@@ -1312,34 +1409,47 @@ if HAVE_SCHEDULER:
         def job_email():
             try:
                 with SessionLocal() as db:
-                    # NEW: use same “today” logic as manual route
-                    today_day = _today_workday_for_email(db, DEFAULT_PLAN_ID, None)
+                    # compute "today"
+                    today_day  = _today_workday_for_email(db, DEFAULT_PLAN_ID, None)
                     start_date = _get_start_date_for_plan(db, DEFAULT_PLAN_ID)
-                    cutoff = max(0, today_day - 1)
-                    summary_html, summary_csv = _build_cumulative_summary(db, DEFAULT_PLAN_ID, cutoff)
-                    carry_html = _build_carryover_block(db, DEFAULT_PLAN_ID)
-                    checklist_html, checklist_csv = _build_three_day_report(db, DEFAULT_PLAN_ID, today_day, span=3)
-
                     today_date = _date_for_day(start_date, today_day).strftime("%d %b %Y")
+
+                    # compact email (links only)
+                    summary_url = (
+                        (BACKEND_PUBLIC_BASE or "").rstrip("/") +
+                        f"/ops/summary_page?plan_id={DEFAULT_PLAN_ID}&day={today_day}"
+                        + (f"&t={CHECK_TOKEN}" if CHECK_TOKEN else "")
+                        + (f"&api={BACKEND_PUBLIC_BASE}" if BACKEND_PUBLIC_BASE else "")
+                    ) if BACKEND_PUBLIC_BASE else ""
+
+                    checklist_url = (
+                        (FRONTEND_PUBLIC_BASE or "").rstrip("/") +
+                        f"/checklist.html?plan={DEFAULT_PLAN_ID}&startDay={today_day}&days=3"
+                        + (f"&t={CHECK_TOKEN}" if CHECK_TOKEN else "")
+                        + (f"&api={BACKEND_PUBLIC_BASE}" if BACKEND_PUBLIC_BASE else "")
+                    ) if FRONTEND_PUBLIC_BASE else ""
+
+                    btns = _cta_button(summary_url, "Open Summary Dashboard")
+                    if checklist_url:
+                        btns += _cta_button(checklist_url, "Open Live Checklist", "#059669")
+
                     html = f"""
                       <div style="font-family:Arial,Helvetica,sans-serif">
                         <h2 style="margin:0 0 12px 0">Daily Report — Day {today_day} ({today_date})</h2>
-                        {summary_html}
-                        <div style="height:16px"></div>
-                        {carry_html}
-                        <div style="height:16px"></div>
-                        <h2 style="margin:12px 0 8px 0">Checklist (Today + next 2 days)</h2>
-                        {checklist_html}
+                        <p style="margin:0 0 10px 0;color:#374151">Click a button to view today’s reports:</p>
+                        {btns}
+                        <div style="height:12px"></div>
+                        <div style="color:#6b7280;font-size:12px">If the buttons don't open, copy these links:<br>
+                          <div style="word-break:break-all"><b>Summary:</b> {summary_url or '—'}</div>
+                          {('<div style="word-break:break-all"><b>Checklist:</b> '+checklist_url+'</div>') if checklist_url else ''}
+                        </div>
                       </div>
                     """.strip()
 
                     _send_email(
-                        subject=f"[{DEFAULT_PLAN_ID}] Daily report (Summary + 3-day checklist) — Day {today_day}",
+                        subject=f"[{DEFAULT_PLAN_ID}] Daily report — Day {today_day}",
                         html=html,
-                        attachments=[
-                            (f"checklist_day{today_day}.csv", checklist_csv),
-                            (f"summary_upto_day{cutoff}.csv", summary_csv),
-                        ],
+                        attachments=[],  # compact cron: no attachments
                     )
             except Exception as e:
                 print("Morning email failed:", e)
@@ -1367,4 +1477,5 @@ if HAVE_SCHEDULER:
         scheduler.start()
     except Exception as e:
         print("Scheduler not started:", e)
+
 # ---------- end app.py ----------
