@@ -689,24 +689,43 @@ def _build_cumulative_summary(db: Session, plan_id: str, cutoff_day: int) -> Tup
     # build HTML
     def pct(a,b): return (100.0*a/b) if b>0 else 0.0
 
-    def tabulate(mapping: Dict[str, Dict[str,int]], title: str) -> str:
+   def tabulate(mapping: Dict[str, Dict[str,int]], title: str) -> str:
         rows = []
-        rows.append(f"<h3 style='margin:10px 0'>{title}</h3>")
-        rows.append("<table border='0' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:Arial;font-size:14px;width:100%'>")
-        rows.append("<tr style='background:#f3f4f6'><th align='left'>Name</th><th>Done</th><th>In-prog</th><th>Pending</th><th>Total</th><th align='left'>Progress</th></tr>")
+        rows.append(f"<h3>{title}</h3>")
+        rows.append("<table border='0' cellpadding='6' cellspacing='0' "
+                    "style='border-collapse:collapse;font-family:Arial;font-size:14px;width:100%'>")
+        rows.append("<tr style='background:#f3f4f6'>"
+                    "<th align='left'>Name</th><th>Done</th><th>In-prog</th><th>Pending</th>"
+                    "<th>Total</th><th>% Done</th><th align='left'>Mix</th></tr>")
         for name in sorted(mapping.keys()):
             m = mapping[name]
-            pr = pct(m['done'], m['total'])
-            bar = _simple_bar(pr)
+            total = max(1, m['total'])
+            pct_done   = round(100.0 * m['done']   / total, 1)
+            pct_inprog = round(100.0 * m['inprog'] / total, 1)
+            pct_pend   = round(100.0 * m['pending']/ total, 1)
+            bar = (
+              "<div style='width:160px;background:#e5e7eb;border-radius:8px;overflow:hidden;height:8px;display:inline-block'>"
+              f"<div style='width:{pct_done}%;height:8px;background:#10b981;display:inline-block'></div>"
+              f"<div style='width:{pct_inprog}%;height:8px;background:#f59e0b;display:inline-block'></div>"
+              f"<div style='width:{pct_pend}%;height:8px;background:#9ca3af;display:inline-block'></div>"
+              "</div>"
+            )
             rows.append(
-                f"<tr><td>{name}</td><td align='center'>{m['done']}</td><td align='center'>{m['inprog']}</td>"
-                f"<td align='center'>{m['pending']}</td><td align='center'>{m['total']}</td>"
-                f"<td align='left'>{bar}</td></tr>"
+                f"<tr>"
+                f"<td>{name}</td>"
+                f"<td align='center'>{m['done']}</td>"
+                f"<td align='center'>{m['inprog']}</td>"
+                f"<td align='center'>{m['pending']}</td>"
+                f"<td align='center'>{m['total']}</td>"
+                f"<td align='center'>{pct_done}%</td>"
+                f"<td>{bar}</td>"
+                f"</tr>"
             )
         if not mapping:
-            rows.append("<tr><td colspan='6' style='color:#6b7280'>No tasks scheduled yet.</td></tr>")
+            rows.append("<tr><td colspan='7' style='color:#6b7280'>No tasks scheduled yet.</td></tr>")
         rows.append("</table>")
         return "\n".join(rows)
+
 
     # pending lists (top 5 per area, oldest first)
     pend_html = ["<h3 style='margin:12px 0 6px 0'>Key pending items by area (oldest first)</h3>"]
