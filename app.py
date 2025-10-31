@@ -589,6 +589,15 @@ class ChecklistProgressItem(BaseModel):
 class ChecklistProgressUpdateIn(BaseModel):
     plan_id: str = DEFAULT_PLAN_ID
     items: List[ChecklistProgressItem]
+class MoveTaskIn(BaseModel):
+    plan_id: str = DEFAULT_PLAN_ID
+    src_area: str
+    src_day: conint(ge=1)
+    index: conint(ge=0)
+    dst_day: conint(ge=1)
+    dst_area: Optional[str] = None
+    keep_progress: bool = True
+
 
 @ops.post("/checklist_progress")
 def checklist_progress(payload: ChecklistProgressUpdateIn, token: Optional[str] = None, db: Session = Depends(get_db)):
@@ -609,6 +618,55 @@ def checklist_progress(payload: ChecklistProgressUpdateIn, token: Optional[str] 
             updated += 1
     db.commit()
     return {"ok": True, "updated": updated}
+
+@ops.post("/move_task")
+def move_task(payload: MoveTaskIn, token: Optional[str] = None, db: Session = Depends(get_db)):
+    if not CHECK_TOKEN or token != CHECK_TOKEN:
+        raise HTTPException(401, "Invalid token")
+
+    plan = db.get(Plan, payload.plan_id)
+    if not plan:
+        raise HTTPException(404, "Plan not found")
+
+    # source cell
+    src = db.query(Cell).filter_by(
+        plan_id=payload.plan_id, area=payload.src_area, day=int(payload.src_day)
+    ).one_or_none()
+    if not src:
+        raise HTTPException(404, f"Source cell not found: {payload.src_area} day {payload.src_day}")
+
+    acts = list(src.activities or [])
+    if payload.index < 0 or payload.index >= len(acts):
+        raise HTTPException(400, "Bad index")
+
+    moved_item = acts.pop(payload.index)
+    src.activities = acts
+
+    # normalize flags
+    if payload.keep_progress:
+        moved_item = _clear_done_keep_progress(moved_item)
+    else:
+        moved_item = _clear_done_and_progress(moved_item)
+
+    # destination cell
+    dst_area = payload.dst_area or payload.src_area
+    dst = db.query(Cell).filter_by(
+        plan_id=payload.plan_id, area=dst_area, day=int(payload.dst_day)
+    ).one_or_none()
+    if dst:
+        lst = list(dst.activities or [])
+        lst.append(moved_item)
+        dst.activities = lst
+    else:
+        db.add(Cell(plan_id=payload.plan_id, area=dst_area, day=int(payload.dst_day), activities=[moved_item]))
+
+    db.commit()
+    return {
+        "ok": True,
+        "from": {"area": payload.src_area, "day": int(payload.src_day), "index": int(payload.index)},
+        "to": {"area": dst_area, "day": int(payload.dst_day)},
+    }
+
 
 # =========================
 # Email builders + senders
