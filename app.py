@@ -821,7 +821,7 @@ def _build_cumulative_summary(db: Session, plan_id: str, cutoff_day: int) -> Tup
 
     html = f"""
     <div style="font-family:Arial,Helvetica,sans-serif">
-      <h2 style="margin:0 0 8px 0">Daily Summary (cumulative up to yesterday)</h2>
+      <h2 style="margin:0 0 8px 0">Daily Summary (cumulative up to today)</h2>
       <div style="margin:4px 0 12px 0"><b>Overall progress:</b> {overall_bar}</div>
       {tabulate(per_area, "Per-area cumulative")}
       <div style="height:16px"></div>
@@ -1175,7 +1175,7 @@ def summary_page(
     # pick day
     today_day = _today_workday_for_email(db, plan_id, day if (day and day >= 1) else None)
     start_date = _get_start_date_for_plan(db, plan_id)
-    cutoff = max(0, today_day - 1)
+    cutoff = today_day
     summary_html, summary_csv = _build_cumulative_summary(db, plan_id, cutoff)
     carry_html = _build_carryover_block(db, plan_id)
 
@@ -1242,7 +1242,7 @@ def send_daily_email(
             else:
                 today_idx = server_today
 
-            cutoff = max(0, today_idx - 1)
+            cutoff = today_day
             today_date = _date_for_day(start_date, today_idx).strftime("%d %b %Y")
 
             if int(compact) == 1:
