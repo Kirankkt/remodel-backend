@@ -1242,7 +1242,7 @@ def send_daily_email(
             else:
                 today_idx = server_today
 
-            cutoff = today_day
+            cutoff = today_idx
             today_date = _date_for_day(start_date, today_idx).strftime("%d %b %Y")
 
             if int(compact) == 1:
