@@ -223,8 +223,11 @@ def _get_start_date_for_plan(db: Session, plan_id: str) -> date:
         return datetime.strptime(PROJECT_START_DATE, "%Y-%m-%d").date()
     return _today_local()
 
-# --- OFF-DAYS (Sundays + Dec 24/25/26 + Dec 31 + Jan 1, any year) ---
-OFF_MD = {(12,24), (12,25), (12,26), (12,31), (1,1)}
+# --- OFF-DAYS (Sundays + Holidays) ---
+OFF_MD = {
+    (12, 24), (12, 25), (12, 26), (12, 31), (1, 1),
+    (3, 3), (3, 20), (4, 3), (4, 15), (5, 1), (5, 27)
+}
 
 def _is_off(d: date) -> bool:
     return d.weekday() == 6 or (d.month, d.day) in OFF_MD
