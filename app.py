@@ -1319,8 +1319,12 @@ def send_daily_email(
 def rollover(plan_id: str = DEFAULT_PLAN_ID):
     try:
         with SessionLocal() as db:
+            today = _today_local()
+            if _is_off(today):
+                raise HTTPException(400, "Cannot perform rollover on an off-day (e.g., Sunday).")
+            
             start_date = _get_start_date_for_plan(db, plan_id)
-            from_day = max(1, _workday_index(start_date, _today_local()))
+            from_day = max(1, _workday_index(start_date, today))
             moved = _rollover_incomplete(db, plan_id, from_day)
             return {"ok": True, "moved": moved, "from_day": from_day, "to_day": from_day + 1}
     except Exception as e:
@@ -1397,8 +1401,12 @@ def checklist_reset_all(plan_id: str = DEFAULT_PLAN_ID):
 @ops.post("/rollover_logged", dependencies=[Depends(require_key)])
 def rollover_logged(plan_id: str = DEFAULT_PLAN_ID):
     with SessionLocal() as db:
+        today = _today_local()
+        if _is_off(today):
+            raise HTTPException(400, "Cannot perform rollover on an off-day (e.g., Sunday).")
+            
         start = _get_start_date_for_plan(db, plan_id)
-        from_day = max(1, _workday_index(start, _today_local()))
+        from_day = max(1, _workday_index(start, today))
         moved, detail = _rollover_incomplete_with_detail(db, plan_id, from_day)
         log = RolloverLog(plan_id=plan_id, from_day=from_day, to_day=from_day+1, moved=detail)
         db.add(log)
